@@ -152,6 +152,10 @@
 // ============ Recovery ============
 #define UTURN_MIN_MS 700
 #define UTURN_STOP_MS 180
+#define CP_UTURN_SPEED 34
+#define CP_UTURN_MIN_MS 420
+#define CP_UTURN_MAX_MS 1400
+#define CP_UTURN_STOP_MS 80
 #define LOST_GRACE_MS 450
 #define ENABLE_STUCK_WATCHDOG 0
 #define STUCK_MAX_MS 30000
@@ -247,6 +251,7 @@ bool jct_consumes_plan = false;
 bool jct_turn_aligned = false;
 unsigned long jct_align_seen_since = 0;
 unsigned long jct_commit_start = 0;
+bool uturn_from_checkpoint = false;
 
 // --- Prototypes ---
 void PCF8574Write(byte data);
@@ -263,7 +268,7 @@ unsigned int minAlignMsForDirection(int dir);
 unsigned int maxAlignMsForDirection(int dir);
 char directionLogChar(int dir);
 void resetJunctionRefs();
-void prepareJunctionChoice(unsigned long now);
+void prepareJunctionChoice(unsigned long now, bool from_checkpoint);
 bool joystickPressEdge();
 void waitJoystickRelease();
 long readVccMilliVolts();
@@ -440,9 +445,10 @@ void resetJunctionRefs()
   jct_turn_aligned = false;
   jct_align_seen_since = 0;
   jct_commit_start = 0;
+  uturn_from_checkpoint = false;
 }
 
-void prepareJunctionChoice(unsigned long now)
+void prepareJunctionChoice(unsigned long now, bool from_checkpoint)
 {
   int planned_dir = (moves_seq_idx < TURNS_LEN) ? turns[moves_seq_idx] : DIR_FRONT;
   jct_consumes_plan = moves_seq_idx < TURNS_LEN;
@@ -451,6 +457,7 @@ void prepareJunctionChoice(unsigned long now)
 
   jct_target_dir = planned_dir;
   jct_choice = directionLogChar(planned_dir);
+  uturn_from_checkpoint = from_checkpoint && planned_dir == DIR_BACK;
 
   if (directionTurnsLeft(planned_dir) || directionTurnsRight(planned_dir))
   {
@@ -963,6 +970,7 @@ void loop()
   // Stuck watchdog
   if (ENABLE_STUCK_WATCHDOG && robotState == ST_NORMAL && !line_visible && (now - last_event_time) > STUCK_MAX_MS)
   {
+    uturn_from_checkpoint = false;
     logMove('U');
     last_event_time = now;
     robotState = ST_UTURN;
@@ -975,6 +983,7 @@ void loop()
   case ST_NORMAL:
     if (obstacle_blocking)
     {
+      uturn_from_checkpoint = false;
       setMotors(0, 0);
       delay(OBSTACLE_STOP_MS);
       logMove('U');
@@ -1013,6 +1022,7 @@ void loop()
   case ST_LOST:
     if (obstacle_blocking)
     {
+      uturn_from_checkpoint = false;
       setMotors(0, 0);
       delay(OBSTACLE_STOP_MS);
       logMove('U');
@@ -1035,6 +1045,7 @@ void loop()
     }
     else if ((now - stateEnterTime) > LOST_GRACE_MS)
     {
+      uturn_from_checkpoint = false;
       logMove('U');
       last_event_time = now;
       robotState = ST_UTURN;
@@ -1075,7 +1086,7 @@ void loop()
 #endif
       last_event_time = now;
       resetJunctionRefs();
-      prepareJunctionChoice(now);
+      prepareJunctionChoice(now, true);
     }
     break;
   }
@@ -1123,13 +1134,31 @@ void loop()
     break;
 
   case ST_UTURN:
-    if ((now - stateEnterTime) > (UTURN_STOP_MS + UTURN_MIN_MS) && centered_line)
+  {
+    unsigned int stop_ms = uturn_from_checkpoint ? CP_UTURN_STOP_MS : UTURN_STOP_MS;
+    unsigned int min_ms = uturn_from_checkpoint ? CP_UTURN_MIN_MS : UTURN_MIN_MS;
+    unsigned int max_ms = uturn_from_checkpoint ? CP_UTURN_MAX_MS : 0;
+    bool checkpoint_line = !cp_pad_seen && cp_black_count <= CP_EXIT_BLACK_MAX &&
+                           (s1 || s2 || s3);
+    bool line_ready = uturn_from_checkpoint ? checkpoint_line : centered_line;
+    unsigned long turn_time = now - stateEnterTime;
+    if (turn_time > (stop_ms + min_ms) && line_ready)
     {
+      uturn_from_checkpoint = false;
+      robotState = ST_NORMAL;
+      stateEnterTime = now;
+      last_event_time = now;
+    }
+    else if (uturn_from_checkpoint && max_ms > 0 &&
+             turn_time > (stop_ms + max_ms) && !cp_pad_seen)
+    {
+      uturn_from_checkpoint = false;
       robotState = ST_NORMAL;
       stateEnterTime = now;
       last_event_time = now;
     }
     break;
+  }
 
   case ST_JCT_ENTRY:
     if (s0 || s4)
@@ -1139,7 +1168,7 @@ void loop()
       if (((now - stateEnterTime) >= JCT_ENTRY_MIN_MS && exited_entry_blob) ||
           ((now - stateEnterTime) >= JCT_ENTRY_MAX_MS))
       {
-        prepareJunctionChoice(now);
+        prepareJunctionChoice(now, false);
       }
     }
     break;
@@ -1295,14 +1324,15 @@ void loop()
     break;
   case ST_UTURN:
   {
-    if ((now - stateEnterTime) < UTURN_STOP_MS)
+    unsigned int stop_ms = uturn_from_checkpoint ? CP_UTURN_STOP_MS : UTURN_STOP_MS;
+    if ((now - stateEnterTime) < stop_ms)
     {
       left_speed = 0;
       right_speed = 0;
     }
     else
     {
-      int p = SHARP_PIVOT_SPEED;
+      int p = uturn_from_checkpoint ? CP_UTURN_SPEED : SHARP_PIVOT_SPEED;
       if (recent_side >= 0)
       {
         left_speed = p;
