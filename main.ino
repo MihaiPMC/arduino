@@ -13,25 +13,25 @@
      cercuri tangente. Mai multe trigger-uri independente,
      fara cerinta de "error stable" (care bloca pe curbe).
    - Eliminat ST_JCT_CP_VERIFY (cauza dubla numarare CP).
-   - turns[] (NOUA conventie: 0=u-turn, 1=prima iesire dinspre stanga,
-     2=a doua iesire dinspre stanga, ...) injectat de UI-ul web.
-   - turns[] se consuma doar la noduri cu alegere reala. Virajele fortate
-     si checkpoint-urile nu muta indexul secventei.
+   - turns[] foloseste 8 directii relative fixe:
+     0=spate, 1=stanga-jos, 2=stanga, 3=stanga-sus,
+     4=fata/sus, 5=dreapta-sus, 6=dreapta, 7=dreapta-jos.
+   - turns[] se consuma la fiecare intersectie detectata. Checkpoint-urile
+     nu muta indexul secventei.
    - Virajele stanga/dreapta se opresc cand linia noua este regasita,
      cu timeout de siguranta, nu doar dupa timp fix.
-   - Scanarea iesirilor ignora pata neagra groasa din mijlocul intersectiei
-     si cauta o linie subtire/stabila pe directia scanata.
+   - La intersectie nu mai scanam toate muchiile. Robotul cauta doar directia
+     primita din turns[].
 
   Conventie secventa:
-    0 = u-turn (intoarcere prin ramura din spate)
-    1 = prima iesire dinspre stanga (cea mai apropiata de spate-stanga)
-    2 = a doua iesire dinspre stanga
-    ...
-    K = ultima iesire (cea mai dinspre dreapta)
-  Numerotam DOAR iesirile reale detectate prin scan, ignorand ramura
-  prin care am venit. Indexul 0 din tabelul intern jct_exit_actions
-  ramane rezervat pentru 'B' (u-turn), iar indecsii >=1 corespund
-  iesirilor sortate stanga -> dreapta.
+    0 = spate / jos
+    1 = stanga-jos
+    2 = stanga
+    3 = stanga-sus
+    4 = fata / sus
+    5 = dreapta-sus
+    6 = dreapta
+    7 = dreapta-jos
 */
 
 #include <Adafruit_NeoPixel.h>
@@ -103,7 +103,16 @@
 #define JCT_COOLDOWN_MS      700   // redus de la 900
 #define JCT_ERR_JUMP         900   // saritura brusca de eroare = bifurcatie Y (era 1100)
 #define JCT_ERR_JUMP_MS       25
-#define JCT_DECISION_MIN_REAL_EXITS 2  // minim 2 iesiri reale ca sa consumam turns[]
+
+// ============ Directii relative primite din turns[] ============
+#define DIR_BACK              0
+#define DIR_BACK_LEFT         1
+#define DIR_LEFT              2
+#define DIR_FRONT_LEFT        3
+#define DIR_FRONT             4
+#define DIR_FRONT_RIGHT       5
+#define DIR_RIGHT             6
+#define DIR_BACK_RIGHT        7
 
 // ============ ODOMETRIE (fara encoderi - bazata pe PWM*timp) ============
 // Calibrare: la ~PWM 40 robotul merge cu ~85 mm/s.
@@ -112,22 +121,22 @@
 #define WHEEL_BASE_MM         105   // distanta intre roti pt rotatii
 #define ODO_MAX_DT_MS          50   // ignora pasi mari (pauze, delay-uri)
 
-// ============ Scan unghi (din sketch-ul original) ============
-#define JCT_STEP45_MS        280
-#define JCT_RETURN90_MS      560
-#define JCT_SETTLE_MS        140
-#define JCT_SCAN_MS          180
-#define JCT_LINE_CONFIRM_MS   70
-#define JCT_SCAN_BLACK_MAX     3   // peste 3 senzori negri = centru/pata, nu iesire clara
-#define JCT_SPLIT_DIAGONAL_EXITS 0 // 1 daca traseul are si 45 si 90 pe aceeasi parte
-
 // ============ Turn execution ============
 #define TURN_L_MS            430
 #define TURN_R_MS            320
-#define TURN_DIAG_ALIGN_MIN_MS 140
-#define TURN_HARD_ALIGN_MARGIN_MS 80
+#define TURN_LEFT_45_MIN_MS  160
+#define TURN_RIGHT_45_MIN_MS 140
+#define TURN_LEFT_90_MIN_MS  350
+#define TURN_RIGHT_90_MIN_MS 240
+#define TURN_LEFT_135_MIN_MS 550
+#define TURN_RIGHT_135_MIN_MS 440
+#define TURN_LEFT_45_MAX_MS  330
+#define TURN_RIGHT_45_MAX_MS 270
+#define TURN_LEFT_90_MAX_MS  650
+#define TURN_RIGHT_90_MAX_MS 520
+#define TURN_LEFT_135_MAX_MS 800
+#define TURN_RIGHT_135_MAX_MS 600
 #define TURN_ALIGN_CONFIRM_MS 45
-#define TURN_ALIGN_TIMEOUT_MS 900
 #define COMMIT_DRIVE_MS      180
 
 // ============ Recovery ============
@@ -144,11 +153,11 @@
 #define SHOW_ODOMETRY_ON_OLED  0   // UNO are RAM putin; 0 = afisaj sigur ca inainte
 #define JOY_DEBOUNCE_MS       30
 #define JOY_MIN_HOLD_MS      150
-#define MAX_JUNCTION_EXITS     6   // B + < + L + F + R + >
 
 // ====================================================
 // SECVENTA DE IESIRI (injectata de UI-ul web prin downloadIno)
-// 0 = u-turn, 1 = prima iesire dinspre stanga, 2 = a doua, ...
+// 0=spate, 1=stanga-jos, 2=stanga, 3=stanga-sus,
+// 4=fata/sus, 5=dreapta-sus, 6=dreapta, 7=dreapta-jos.
 // ====================================================
 // <AI:turns_array>
 const int turns[] = { 3, 1, 1, 2, 0, 1, 2, 2, 3, 2, 2 };
@@ -200,14 +209,6 @@ enum RobotState {
   ST_CP_STOP,        // optional: stop+joy dupa CP
   ST_UTURN,
   ST_JCT_ENTRY,
-  ST_JCT_L45_TURN, ST_JCT_L45_SCAN,
-  ST_JCT_L90_TURN, ST_JCT_L90_SCAN,
-  ST_JCT_BACK_CENTER_FROM_LEFT,
-  ST_JCT_CENTER_SCAN_1,
-  ST_JCT_R45_TURN, ST_JCT_R45_SCAN,
-  ST_JCT_R90_TURN, ST_JCT_R90_SCAN,
-  ST_JCT_BACK_CENTER_FROM_RIGHT,
-  ST_JCT_CENTER_SCAN_2,
   ST_JCT_STOP,
   ST_JCT_EXECUTE
 };
@@ -227,26 +228,9 @@ unsigned long cp_enter_time = 0;
 
 // ===== junction snapshots =====
 bool jct_saw_entry_corners = false;
-unsigned long jct_scan_seen_since = 0;
-bool jct_scan_latched = false;
-bool ref_center_before = false;
-bool ref_center_mid    = false;
-bool ref_center_after  = false;
-bool ref_left45        = false;
-bool ref_left90        = false;
-bool ref_right45       = false;
-bool ref_right90       = false;
-bool jct_hint_L = false;
-bool jct_hint_R = false;
-bool jct_arm_L = false;
-bool jct_arm_F = false;
-bool jct_arm_R = false;
 char jct_choice = '?';
+int jct_target_dir = DIR_FRONT;
 unsigned long jct_execute_ms = 0;
-char jct_exit_actions[MAX_JUNCTION_EXITS] = {'B', 0, 0, 0, 0, 0};
-char jct_exit_labels[24] = "0B";
-uint8_t jct_exit_count = 1;
-int8_t jct_selected_exit = -1;
 bool jct_consumes_plan = false;
 bool jct_turn_aligned = false;
 unsigned long jct_align_seen_since = 0;
@@ -259,19 +243,15 @@ uint32_t Wheel(byte WheelPos);
 void setMotors(int left, int right);
 void logMove(char m);
 void showStatus();
-bool snapshotHasLineAhead();
-bool scanExitSampleHasLine();
-bool scanLineConfirmed(unsigned long now);
 bool turnAlignmentLineSeen();
-bool actionTurnsLeft(char action);
-bool actionTurnsRight(char action);
-unsigned int minAlignMsForAction(char action);
+bool validDirection(int dir);
+bool directionTurnsLeft(int dir);
+bool directionTurnsRight(int dir);
+unsigned int minAlignMsForDirection(int dir);
+unsigned int maxAlignMsForDirection(int dir);
+char directionLogChar(int dir);
 void resetJunctionRefs();
-void buildExitTable();
-void updateExitLabels();
-void finalizeEvidence();
 void prepareJunctionChoice(unsigned long now);
-char actionFromTurnIndex(int t);
 bool joystickPressEdge();
 void waitJoystickRelease();
 long readVccMilliVolts();
@@ -336,43 +316,6 @@ void logMove(char m) {
   }
 }
 
-bool snapshotHasLineAhead() {
-  bool c  = sensorValues[2] > CENTER_BLACK;
-  bool l1 = sensorValues[1] > JCT_INNER_THRESHOLD;
-  bool r1 = sensorValues[3] > JCT_INNER_THRESHOLD;
-  int relaxed_black = 0;
-  for (int k = 0; k < NUM_SENSORS; k++) {
-    if (sensorValues[k] > CP_BLACK_THRESHOLD) relaxed_black++;
-  }
-  return c && (l1 || r1) && relaxed_black <= JCT_SCAN_BLACK_MAX;
-}
-bool scanExitSampleHasLine() {
-  bool s0 = sensorValues[0] > JCT_SIDE_THRESHOLD;
-  bool s1 = sensorValues[1] > JCT_INNER_THRESHOLD;
-  bool s2 = sensorValues[2] > CENTER_BLACK;
-  bool s3 = sensorValues[3] > JCT_INNER_THRESHOLD;
-  bool s4 = sensorValues[4] > JCT_SIDE_THRESHOLD;
-  int relaxed_black = 0;
-  for (int k = 0; k < NUM_SENSORS; k++) {
-    if (sensorValues[k] > CP_BLACK_THRESHOLD) relaxed_black++;
-  }
-
-  bool thin_enough = relaxed_black > 0 && relaxed_black <= JCT_SCAN_BLACK_MAX;
-  bool centered = s2 && (s1 || s3 || sensorValues[2] > BLACK_THRESHOLD);
-  bool adjacent_pair = (s0 && s1) || (s1 && s2) || (s2 && s3) || (s3 && s4);
-
-  return thin_enough && (centered || adjacent_pair);
-}
-bool scanLineConfirmed(unsigned long now) {
-  if (scanExitSampleHasLine()) {
-    if (jct_scan_seen_since == 0) jct_scan_seen_since = now;
-    if ((now - jct_scan_seen_since) >= JCT_LINE_CONFIRM_MS) jct_scan_latched = true;
-  } else {
-    jct_scan_seen_since = 0;
-  }
-  return jct_scan_latched;
-}
-
 bool turnAlignmentLineSeen() {
   bool c = sensorValues[2] > CENTER_BLACK;
   bool near_left = sensorValues[1] > JCT_INNER_THRESHOLD;
@@ -383,141 +326,75 @@ bool turnAlignmentLineSeen() {
   }
 
   // Nu oprim rotatia pe un patrat/checkpoint sau pe miezul gros al intersectiei.
-  return c && (near_left || near_right || sensorValues[2] > BLACK_THRESHOLD) &&
-         black <= JCT_SCAN_BLACK_MAX;
+  return c && (near_left || near_right || sensorValues[2] > BLACK_THRESHOLD) && black <= 3;
 }
 
-bool actionTurnsLeft(char action) {
-  return action == '<' || action == 'L';
+bool validDirection(int dir) {
+  return dir >= DIR_BACK && dir <= DIR_BACK_RIGHT;
 }
 
-bool actionTurnsRight(char action) {
-  return action == 'R' || action == '>';
+bool directionTurnsLeft(int dir) {
+  return dir == DIR_BACK_LEFT || dir == DIR_LEFT || dir == DIR_FRONT_LEFT;
 }
 
-unsigned int minAlignMsForAction(char action) {
-  if (action == '<') return TURN_L_MS - TURN_HARD_ALIGN_MARGIN_MS;
-  if (action == '>') return TURN_R_MS - TURN_HARD_ALIGN_MARGIN_MS;
-  return TURN_DIAG_ALIGN_MIN_MS;
+bool directionTurnsRight(int dir) {
+  return dir == DIR_FRONT_RIGHT || dir == DIR_RIGHT || dir == DIR_BACK_RIGHT;
+}
+
+unsigned int minAlignMsForDirection(int dir) {
+  switch (dir) {
+    case DIR_BACK_LEFT:    return TURN_LEFT_135_MIN_MS;
+    case DIR_LEFT:         return TURN_LEFT_90_MIN_MS;
+    case DIR_FRONT_LEFT:   return TURN_LEFT_45_MIN_MS;
+    case DIR_FRONT_RIGHT:  return TURN_RIGHT_45_MIN_MS;
+    case DIR_RIGHT:        return TURN_RIGHT_90_MIN_MS;
+    case DIR_BACK_RIGHT:   return TURN_RIGHT_135_MIN_MS;
+    default:               return 0;
+  }
+}
+
+unsigned int maxAlignMsForDirection(int dir) {
+  switch (dir) {
+    case DIR_BACK_LEFT:    return TURN_LEFT_135_MAX_MS;
+    case DIR_LEFT:         return TURN_LEFT_90_MAX_MS;
+    case DIR_FRONT_LEFT:   return TURN_LEFT_45_MAX_MS;
+    case DIR_FRONT_RIGHT:  return TURN_RIGHT_45_MAX_MS;
+    case DIR_RIGHT:        return TURN_RIGHT_90_MAX_MS;
+    case DIR_BACK_RIGHT:   return TURN_RIGHT_135_MAX_MS;
+    default:               return 0;
+  }
+}
+
+char directionLogChar(int dir) {
+  return validDirection(dir) ? (char)('0' + dir) : '?';
 }
 
 void resetJunctionRefs() {
   jct_saw_entry_corners = false;
-  jct_scan_seen_since = 0;
-  jct_scan_latched = false;
-  ref_center_before = false; ref_center_mid = false; ref_center_after = false;
-  ref_left45 = false; ref_left90 = false;
-  ref_right45 = false; ref_right90 = false;
-  jct_hint_L = false; jct_hint_R = false;
-  jct_arm_L = false; jct_arm_F = false; jct_arm_R = false;
   jct_choice = '?';
-  jct_selected_exit = -1;
+  jct_target_dir = DIR_FRONT;
   jct_execute_ms = 0;
   jct_consumes_plan = false;
   jct_turn_aligned = false;
   jct_align_seen_since = 0;
   jct_commit_start = 0;
-  for (int i = 0; i < MAX_JUNCTION_EXITS; i++) jct_exit_actions[i] = 0;
-  jct_exit_actions[0] = 'B';
-  jct_exit_count = 1;
-  strcpy(jct_exit_labels, "0B");
-}
-
-void buildExitTable() {
-  jct_exit_count = 0;
-  jct_exit_actions[jct_exit_count++] = 'B';
-
-#if JCT_SPLIT_DIAGONAL_EXITS
-  if (ref_left90 && jct_exit_count < MAX_JUNCTION_EXITS) jct_exit_actions[jct_exit_count++] = '<';
-  if (ref_left45 && jct_exit_count < MAX_JUNCTION_EXITS) jct_exit_actions[jct_exit_count++] = 'L';
-  if (jct_hint_L && !ref_left90 && !ref_left45 &&
-      jct_exit_count < MAX_JUNCTION_EXITS) {
-    jct_exit_actions[jct_exit_count++] = 'L';
-  }
-#else
-  if (jct_arm_L && jct_exit_count < MAX_JUNCTION_EXITS) {
-    jct_exit_actions[jct_exit_count++] = ref_left90 ? '<' : 'L';
-  }
-#endif
-
-  if (jct_arm_F && jct_exit_count < MAX_JUNCTION_EXITS) jct_exit_actions[jct_exit_count++] = 'F';
-
-#if JCT_SPLIT_DIAGONAL_EXITS
-  if (ref_right45 && jct_exit_count < MAX_JUNCTION_EXITS) jct_exit_actions[jct_exit_count++] = 'R';
-  if (ref_right90 && jct_exit_count < MAX_JUNCTION_EXITS) jct_exit_actions[jct_exit_count++] = '>';
-  if (jct_hint_R && !ref_right45 && !ref_right90 &&
-      jct_exit_count < MAX_JUNCTION_EXITS) {
-    jct_exit_actions[jct_exit_count++] = 'R';
-  }
-#else
-  if (jct_arm_R && jct_exit_count < MAX_JUNCTION_EXITS) {
-    jct_exit_actions[jct_exit_count++] = ref_right90 ? '>' : 'R';
-  }
-#endif
-}
-void updateExitLabels() {
-  int w = 0;
-  for (uint8_t i = 0; i < jct_exit_count && w < (int)sizeof(jct_exit_labels) - 3; i++) {
-    jct_exit_labels[w++] = '0' + i;
-    jct_exit_labels[w++] = jct_exit_actions[i];
-    jct_exit_labels[w++] = ' ';
-  }
-  if (w > 0) w--;
-  jct_exit_labels[w] = 0;
-}
-void finalizeEvidence() {
-  int center_hits = (ref_center_before?1:0) + (ref_center_mid?1:0) + (ref_center_after?1:0);
-  jct_arm_L = jct_hint_L || ref_left45 || ref_left90;
-  jct_arm_R = jct_hint_R || ref_right45 || ref_right90;
-  jct_arm_F = center_hits >= 2;
-  buildExitTable();
-  updateExitLabels();
-}
-
-// ===== mapare turn (din UI) -> actiune =====
-// Conventie noua:
-//   turns[i] = 0       -> u-turn (intotdeauna disponibil, indexul 0 din tabel)
-//   turns[i] = N >= 1  -> a N-a iesire detectata, sortata stanga -> dreapta
-// jct_exit_actions[] are: [0]='B', apoi iesirile reale in ordinea:
-// '<' stanga 90, 'L' stanga oblic, 'F' fata, 'R' dreapta oblic, '>' dreapta 90.
-// Cu JCT_SPLIT_DIAGONAL_EXITS=0, scanarile 45/90 de pe aceeasi parte se unesc
-// ca sa nu dubleze aceeasi ramura lata.
-char actionFromTurnIndex(int t) {
-  if (t <= 0) return 'B';
-  if (t < (int)jct_exit_count) return jct_exit_actions[t];
-  // turn cere o iesire care nu a fost detectata -> fallback
-  return jct_exit_actions[jct_exit_count - 1];
 }
 
 void prepareJunctionChoice(unsigned long now) {
-  // Consumam secventa doar cand exista cel putin doua iesiri reale
-  // (ex.: T/cross). O singura iesire reala este viraj fortat, nu decizie.
-  uint8_t real_exits = (jct_exit_count > 0) ? (jct_exit_count - 1) : 0;
-  bool decision_node = real_exits >= JCT_DECISION_MIN_REAL_EXITS;
-  int planned_idx = (decision_node && moves_seq_idx < TURNS_LEN) ? turns[moves_seq_idx] : -1;
-  char chosen;
-  if (!decision_node) {
-    // Drum fara alegere: ia singura iesire reala, sau intoarce daca e capat.
-    chosen = (jct_exit_count >= 2) ? jct_exit_actions[1] : 'B';
-  } else if (planned_idx < 0) {
-    // Nod cu alegere, dar fara plan ramas: prefera cea mai din stanga.
-    chosen = (jct_exit_count >= 2) ? jct_exit_actions[1] : 'B';
+  int planned_dir = (moves_seq_idx < TURNS_LEN) ? turns[moves_seq_idx] : DIR_FRONT;
+  jct_consumes_plan = moves_seq_idx < TURNS_LEN;
+  if (!validDirection(planned_dir)) planned_dir = DIR_FRONT;
+
+  jct_target_dir = planned_dir;
+  jct_choice = directionLogChar(planned_dir);
+
+  if (directionTurnsLeft(planned_dir) || directionTurnsRight(planned_dir)) {
+    jct_execute_ms = maxAlignMsForDirection(planned_dir) + COMMIT_DRIVE_MS;
+  } else if (planned_dir == DIR_FRONT) {
+    jct_execute_ms = COMMIT_DRIVE_MS;
   } else {
-    chosen = actionFromTurnIndex(planned_idx);
+    jct_execute_ms = UTURN_MIN_MS;
   }
-  jct_consumes_plan = decision_node && planned_idx >= 0;
-
-  jct_choice = chosen;
-  // Marker exit selectat (pentru OLED)
-  jct_selected_exit = 0;
-  for (uint8_t i = 0; i < jct_exit_count; i++) {
-    if (jct_exit_actions[i] == chosen) { jct_selected_exit = i; break; }
-  }
-
-  if (actionTurnsLeft(chosen))  jct_execute_ms = TURN_ALIGN_TIMEOUT_MS + COMMIT_DRIVE_MS;
-  else if (actionTurnsRight(chosen)) jct_execute_ms = TURN_ALIGN_TIMEOUT_MS + COMMIT_DRIVE_MS;
-  else if (chosen == 'F') jct_execute_ms = COMMIT_DRIVE_MS;
-  else                    jct_execute_ms = UTURN_MIN_MS;
   jct_turn_aligned = false;
   jct_align_seen_since = 0;
   jct_commit_start = 0;
@@ -526,9 +403,9 @@ void prepareJunctionChoice(unsigned long now) {
 #if DEBUG_JUNCTION_STOP
   robotState = ST_JCT_STOP;
 #else
-  logMove(chosen);
+  logMove(jct_choice);
   if (jct_consumes_plan) moves_seq_idx++;
-  robotState = (chosen == 'B') ? ST_UTURN : ST_JCT_EXECUTE;
+  robotState = (planned_dir == DIR_BACK) ? ST_UTURN : ST_JCT_EXECUTE;
 #endif
   stateEnterTime = now;
 }
@@ -591,18 +468,6 @@ void printStateCode() {
     case ST_CP_STOP:       display.print(F("CPS")); break;
     case ST_UTURN:         display.print(F("UTN")); break;
     case ST_JCT_ENTRY:     display.print(F("ENT")); break;
-    case ST_JCT_L45_TURN:  display.print(F("L45")); break;
-    case ST_JCT_L45_SCAN:  display.print(F("S45")); break;
-    case ST_JCT_L90_TURN:  display.print(F("L90")); break;
-    case ST_JCT_L90_SCAN:  display.print(F("S90")); break;
-    case ST_JCT_BACK_CENTER_FROM_LEFT:  display.print(F("C<L")); break;
-    case ST_JCT_CENTER_SCAN_1:          display.print(F("SC1")); break;
-    case ST_JCT_R45_TURN:  display.print(F("R45")); break;
-    case ST_JCT_R45_SCAN:  display.print(F("s45")); break;
-    case ST_JCT_R90_TURN:  display.print(F("R90")); break;
-    case ST_JCT_R90_SCAN:  display.print(F("s90")); break;
-    case ST_JCT_BACK_CENTER_FROM_RIGHT: display.print(F("C>R")); break;
-    case ST_JCT_CENTER_SCAN_2:          display.print(F("SC2")); break;
     case ST_JCT_STOP:      display.print(F("JST")); break;
     case ST_JCT_EXECUTE:   display.print(F("JEX")); break;
   }
@@ -619,15 +484,12 @@ void showStatus() {
 
   if (robotState >= ST_JCT_ENTRY && robotState <= ST_JCT_EXECUTE) {
     display.setCursor(0, 12);
-    display.print(F("Ex:")); display.print(jct_exit_count);
-    display.print(F(" Sel:"));
-    if (jct_selected_exit >= 0) display.print(jct_selected_exit); else display.print("-");
+    display.print(F("Dir:")); display.print(jct_target_dir);
+    display.print(F(" Log:")); display.print(jct_choice);
     display.setCursor(0, 24);
-    display.print(jct_exit_labels);
+    display.print(F("0B 1BL 2L 3FL"));
     display.setCursor(0, 36);
-    display.print(F("L:")); display.print(jct_arm_L?1:0);
-    display.print(F(" F:")); display.print(jct_arm_F?1:0);
-    display.print(F(" R:")); display.print(jct_arm_R?1:0);
+    display.print(F("4F 5FR 6R 7BR"));
     display.setCursor(0, 48);
     display.print(F("Seq:")); display.print(moves_seq_idx);
     display.print(F("/")); display.print(TURNS_LEN);
@@ -637,9 +499,7 @@ void showStatus() {
     display.setCursor(0, 56);
     if (robotState == ST_JCT_STOP) display.print(F("Press JOY"));
     else {
-      display.print(F("4:"));
-      display.print(ref_left45?1:0); display.print(ref_left90?1:0);
-      display.print(ref_right45?1:0); display.print(ref_right90?1:0);
+      display.print(F("Target only"));
     }
   } else {
     display.setTextSize(3);
@@ -888,12 +748,8 @@ void loop() {
         stateEnterTime = now;
       }
       else if (jct_armed) {
-        bool hint_left = arm_left_side || arm_edge_l || (arm_widen && s0);
-        bool hint_right = arm_right_side || arm_edge_r || (arm_widen && s4);
         integral = 0; last_error = 0;
         resetJunctionRefs();
-        jct_hint_L = hint_left;
-        jct_hint_R = hint_right;
 #if ENABLE_ODOMETRY
         odo_dist_at_last_jct = odo_dist_mm;
 #endif
@@ -931,12 +787,8 @@ void loop() {
                               (now - cp_last_seen) > CP_GLITCH_GRACE_MS;
       if (cp_lost_too_long) {
         // A fost doar tranzitie (ex. cross). Trecem la junction logic.
-        bool hint_left = arm_left_side || arm_edge_l || (arm_widen && s0);
-        bool hint_right = arm_right_side || arm_edge_r || (arm_widen && s4);
         cp_dense_since = 0;
         resetJunctionRefs();
-        jct_hint_L = hint_left;
-        jct_hint_R = hint_right;
 #if ENABLE_ODOMETRY
         odo_dist_at_last_jct = odo_dist_mm;
 #endif
@@ -994,102 +846,28 @@ void loop() {
     case ST_JCT_ENTRY:
       if (s0 || s4) jct_saw_entry_corners = true;
       {
-        bool exited_entry_blob = jct_saw_entry_corners && !s0 && !s4;
+        bool exited_entry_blob = jct_saw_entry_corners && !s0 && !s4 && sensors_black <= 3;
         if (((now - stateEnterTime) >= JCT_ENTRY_MIN_MS && exited_entry_blob) ||
           ((now - stateEnterTime) >= JCT_ENTRY_MAX_MS)) {
-          ref_center_before = exited_entry_blob &&
-                              (snapshotHasLineAhead() || scanExitSampleHasLine());
-          jct_scan_seen_since = 0; jct_scan_latched = false;
-          robotState = ST_JCT_L45_TURN; stateEnterTime = now;
+          prepareJunctionChoice(now);
         }
       }
       break;
-    case ST_JCT_L45_TURN:
-      if ((now - stateEnterTime) >= JCT_STEP45_MS) {
-        jct_scan_seen_since = 0; jct_scan_latched = false;
-        robotState = ST_JCT_L45_SCAN; stateEnterTime = now;
-      } break;
-    case ST_JCT_L45_SCAN:
-      if ((now - stateEnterTime) >= JCT_SETTLE_MS) scanLineConfirmed(now);
-      if ((now - stateEnterTime) >= (JCT_SETTLE_MS + JCT_SCAN_MS)) {
-        ref_left45 = jct_scan_latched;
-        jct_scan_seen_since = 0; jct_scan_latched = false;
-        robotState = ST_JCT_L90_TURN; stateEnterTime = now;
-      } break;
-    case ST_JCT_L90_TURN:
-      if ((now - stateEnterTime) >= JCT_STEP45_MS) {
-        jct_scan_seen_since = 0; jct_scan_latched = false;
-        robotState = ST_JCT_L90_SCAN; stateEnterTime = now;
-      } break;
-    case ST_JCT_L90_SCAN:
-      if ((now - stateEnterTime) >= JCT_SETTLE_MS) scanLineConfirmed(now);
-      if ((now - stateEnterTime) >= (JCT_SETTLE_MS + JCT_SCAN_MS)) {
-        ref_left90 = jct_scan_latched;
-        jct_scan_seen_since = 0; jct_scan_latched = false;
-        robotState = ST_JCT_BACK_CENTER_FROM_LEFT; stateEnterTime = now;
-      } break;
-    case ST_JCT_BACK_CENTER_FROM_LEFT:
-      if ((now - stateEnterTime) >= JCT_RETURN90_MS) {
-        jct_scan_seen_since = 0; jct_scan_latched = false;
-        robotState = ST_JCT_CENTER_SCAN_1; stateEnterTime = now;
-      } break;
-    case ST_JCT_CENTER_SCAN_1:
-      if ((now - stateEnterTime) >= JCT_SETTLE_MS) scanLineConfirmed(now);
-      if ((now - stateEnterTime) >= (JCT_SETTLE_MS + JCT_SCAN_MS)) {
-        ref_center_mid = jct_scan_latched;
-        jct_scan_seen_since = 0; jct_scan_latched = false;
-        robotState = ST_JCT_R45_TURN; stateEnterTime = now;
-      } break;
-    case ST_JCT_R45_TURN:
-      if ((now - stateEnterTime) >= JCT_STEP45_MS) {
-        jct_scan_seen_since = 0; jct_scan_latched = false;
-        robotState = ST_JCT_R45_SCAN; stateEnterTime = now;
-      } break;
-    case ST_JCT_R45_SCAN:
-      if ((now - stateEnterTime) >= JCT_SETTLE_MS) scanLineConfirmed(now);
-      if ((now - stateEnterTime) >= (JCT_SETTLE_MS + JCT_SCAN_MS)) {
-        ref_right45 = jct_scan_latched;
-        jct_scan_seen_since = 0; jct_scan_latched = false;
-        robotState = ST_JCT_R90_TURN; stateEnterTime = now;
-      } break;
-    case ST_JCT_R90_TURN:
-      if ((now - stateEnterTime) >= JCT_STEP45_MS) {
-        jct_scan_seen_since = 0; jct_scan_latched = false;
-        robotState = ST_JCT_R90_SCAN; stateEnterTime = now;
-      } break;
-    case ST_JCT_R90_SCAN:
-      if ((now - stateEnterTime) >= JCT_SETTLE_MS) scanLineConfirmed(now);
-      if ((now - stateEnterTime) >= (JCT_SETTLE_MS + JCT_SCAN_MS)) {
-        ref_right90 = jct_scan_latched;
-        jct_scan_seen_since = 0; jct_scan_latched = false;
-        robotState = ST_JCT_BACK_CENTER_FROM_RIGHT; stateEnterTime = now;
-      } break;
-    case ST_JCT_BACK_CENTER_FROM_RIGHT:
-      if ((now - stateEnterTime) >= JCT_RETURN90_MS) {
-        jct_scan_seen_since = 0; jct_scan_latched = false;
-        robotState = ST_JCT_CENTER_SCAN_2; stateEnterTime = now;
-      } break;
-    case ST_JCT_CENTER_SCAN_2:
-      if ((now - stateEnterTime) >= JCT_SETTLE_MS) scanLineConfirmed(now);
-      if ((now - stateEnterTime) >= (JCT_SETTLE_MS + JCT_SCAN_MS)) {
-        ref_center_after = jct_scan_latched;
-        finalizeEvidence();
-        prepareJunctionChoice(now);
-      } break;
 
     case ST_JCT_STOP:
       if ((now - stateEnterTime) > JOY_MIN_HOLD_MS && joystickPressEdge()) {
         logMove(jct_choice);
         if (jct_consumes_plan) moves_seq_idx++;
-        robotState = (jct_choice == 'B') ? ST_UTURN : ST_JCT_EXECUTE;
+        robotState = (jct_target_dir == DIR_BACK) ? ST_UTURN : ST_JCT_EXECUTE;
         stateEnterTime = now; last_event_time = now;
       }
       break;
     case ST_JCT_EXECUTE:
-      if (actionTurnsLeft(jct_choice) || actionTurnsRight(jct_choice)) {
+      if (directionTurnsLeft(jct_target_dir) || directionTurnsRight(jct_target_dir)) {
         unsigned long t = now - stateEnterTime;
         if (!jct_turn_aligned) {
-          bool can_accept_line = t >= minAlignMsForAction(jct_choice);
+          bool can_accept_line = t >= minAlignMsForDirection(jct_target_dir);
+          unsigned int align_timeout = maxAlignMsForDirection(jct_target_dir);
           if (can_accept_line && turnAlignmentLineSeen()) {
             if (jct_align_seen_since == 0) jct_align_seen_since = now;
             if ((now - jct_align_seen_since) >= TURN_ALIGN_CONFIRM_MS) {
@@ -1102,7 +880,7 @@ void loop() {
             jct_align_seen_since = 0;
           }
 
-          if (!jct_turn_aligned && t >= TURN_ALIGN_TIMEOUT_MS) {
+          if (!jct_turn_aligned && t >= align_timeout) {
             jct_turn_aligned = true;
             jct_commit_start = now;
             integral = 0;
@@ -1177,24 +955,12 @@ void loop() {
       break;
     }
     case ST_JCT_ENTRY: left_speed = right_speed = INTERSECTION_SPEED; led_color = 0x40FF40; break;
-    case ST_JCT_L45_TURN:
-    case ST_JCT_L90_TURN: left_speed = -JCT_TURN_SPEED; right_speed = JCT_TURN_SPEED; led_color = 0x00FF80; break;
-    case ST_JCT_L45_SCAN:
-    case ST_JCT_L90_SCAN: left_speed = 0; right_speed = 0; led_color = 0x00AA66; break;
-    case ST_JCT_BACK_CENTER_FROM_LEFT: left_speed = JCT_TURN_SPEED; right_speed = -JCT_TURN_SPEED; led_color = 0x00A0FF; break;
-    case ST_JCT_CENTER_SCAN_1: left_speed = 0; right_speed = 0; led_color = 0x2080FF; break;
-    case ST_JCT_R45_TURN:
-    case ST_JCT_R90_TURN: left_speed = JCT_TURN_SPEED; right_speed = -JCT_TURN_SPEED; led_color = 0x0080FF; break;
-    case ST_JCT_R45_SCAN:
-    case ST_JCT_R90_SCAN: left_speed = 0; right_speed = 0; led_color = 0x4444FF; break;
-    case ST_JCT_BACK_CENTER_FROM_RIGHT: left_speed = -JCT_TURN_SPEED; right_speed = JCT_TURN_SPEED; led_color = 0x8040FF; break;
-    case ST_JCT_CENTER_SCAN_2: left_speed = 0; right_speed = 0; led_color = 0xAA44FF; break;
     case ST_JCT_STOP: left_speed = 0; right_speed = 0; led_color = 0x0000FF; break;
     case ST_JCT_EXECUTE: {
-      if (actionTurnsLeft(jct_choice)) {
+      if (directionTurnsLeft(jct_target_dir)) {
         if (!jct_turn_aligned) { left_speed = -JCT_TURN_SPEED; right_speed = JCT_TURN_SPEED; led_color = 0x00FFFF; }
         else { left_speed = right_speed = INTERSECTION_SPEED; led_color = 0xFFFFFF; }
-      } else if (actionTurnsRight(jct_choice)) {
+      } else if (directionTurnsRight(jct_target_dir)) {
         if (!jct_turn_aligned) { left_speed = JCT_TURN_SPEED; right_speed = -JCT_TURN_SPEED; led_color = 0xFFFF00; }
         else { left_speed = right_speed = INTERSECTION_SPEED; led_color = 0xFFFFFF; }
       } else { left_speed = right_speed = INTERSECTION_SPEED; led_color = 0xFFFFFF; }
