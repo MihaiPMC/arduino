@@ -16,8 +16,8 @@
    - turns[] foloseste 8 directii relative fixe:
      0=spate, 1=stanga-jos, 2=stanga, 3=stanga-sus,
      4=fata/sus, 5=dreapta-sus, 6=dreapta, 7=dreapta-jos.
-   - turns[] se consuma la fiecare intersectie detectata. Checkpoint-urile
-     nu muta indexul secventei.
+   - turns[] se consuma la fiecare nod detectat: intersectie sau checkpoint.
+     Daca un checkpoint are 0 in turns[], robotul intoarce pe loc.
    - Virajele stanga/dreapta se opresc cand linia noua este regasita,
      cu timeout de siguranta, nu doar dupa timp fix.
    - La intersectie nu mai scanam toate muchiile. Robotul cauta doar directia
@@ -948,7 +948,7 @@ void loop()
     else if (error < -300)
       recent_side = -1;
   }
-  bool centered_line = s2 && abs(error) < 900;
+  bool centered_line = s2 && abs(error) < 900 && !cp_pad_seen && cp_black_count <= CP_EXIT_BLACK_MAX;
 
   // Obstacole
   if (infraredObstacleAhead())
@@ -1063,18 +1063,19 @@ void loop()
     }
     else if ((now - cp_enter_time) >= (CP_PRELIM_MS + CP_FULL_MS))
     {
-      // CP confirmat
+      // CP confirmat. Checkpoint-ul este nod de decizie si consuma turns[].
       checkpoint_count++;
       checkpoint_lockout_until = now + CP_LOCKOUT_MS;
       cp_exit_time = 0;
       logMove('C');
-      // Checkpoint-ul nu consuma turns[]: lista este doar pentru intersectii.
+      cp_dense_since = 0;
+      cp_last_seen = 0;
 #if ENABLE_ODOMETRY
       odo_dist_at_last_jct = odo_dist_mm;
 #endif
       last_event_time = now;
-      robotState = ST_CP_CONFIRMED;
-      stateEnterTime = now;
+      resetJunctionRefs();
+      prepareJunctionChoice(now);
     }
     break;
   }
