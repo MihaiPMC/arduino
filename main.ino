@@ -1,11 +1,11 @@
 /*
-  AlphaBot2-Ar PathRunner v2
+  AlphaBot2-Ar PathRunner v3
   ----------------------------------------------------------
   Baza hardware: sketch-ul existent al utilizatorului
    (TRSensors, OLED SSD1306, NeoPixel, PCF8574 joystick + IR,
     motor driver standard AlphaBot2-Ar).
 
-  CE E NOU FATA DE V1:
+  NOTE LOGICA:
    - Detectie checkpoint robusta: PATRAT NEGRU PLIN.
      Un patrat se distinge de un cross junction prin DURATA
      in care toti 5 senzori vad negru continuu (>= CP_FULL_MS).
@@ -15,6 +15,10 @@
    - Eliminat ST_JCT_CP_VERIFY (cauza dubla numarare CP).
    - turns[] (NOUA conventie: 0=u-turn, 1=prima iesire dinspre stanga,
      2=a doua iesire dinspre stanga, ...) injectat de UI-ul web.
+   - turns[] se consuma doar la noduri cu alegere reala. Virajele fortate
+     si checkpoint-urile nu muta indexul secventei.
+   - Virajele stanga/dreapta se opresc cand linia noua este regasita,
+     cu timeout de siguranta, nu doar dupa timp fix.
 
   Conventie secventa:
     0 = u-turn (intoarcere prin ramura din spate)
@@ -76,7 +80,7 @@
 #define CP_PRELIM_MS          60   // initial pentru a suspecta CP (redus)
 #define CP_FULL_MS           180   // durata totala pentru confirmare (redusa - era 220)
 #define CP_GLITCH_GRACE_MS    40   // toleranta scurta cand un senzor pierde negrul
-#define CP_EXIT_BLACK_MAX      1   // <=1 senzor negru => iesit din patrat
+#define CP_EXIT_BLACK_MAX      2   // <=2 senzori negri => iesit din patrat
 #define CP_LOCKOUT_MS       1500   // dupa CP, ignora alte detectii
 #define CP_MAX_DURATION_MS  2500   // siguranta: dupa atat, considera iesit
 
@@ -85,17 +89,19 @@
 // Pe linii reale, s0/s4 nu ating mereu 600 cand intra ramura - cu 420 prindem mult mai repede.
 #define JCT_SIDE_THRESHOLD   420
 #define JCT_INNER_THRESHOLD  500   // pt s1/s3 (inner) la detectie laterala
-#define JCT_ARM_SIDE_MS       25   // s0+s2 sau s4+s2 stabil (mult redus)
-#define JCT_ARM_DENSE_MS      40   // 5/5 negru pentru cross/Y (redus)
-#define JCT_ARM_EDGE_MS       50   // s0/s4 cu error mare (Y, tangente)
-#define JCT_ARM_WIDEN_MS      30   // linia se "lateste": centru + lateral oricare
-#define JCT_CONFIRM_MS         5   // confirmare suplimentara minima (aproape instant)
+#define JCT_ARM_SIDE_MS       45   // s0+s2 sau s4+s2 stabil
+#define JCT_ARM_DENSE_MS      55   // 4-5 negri pentru cross/Y
+#define JCT_ARM_EDGE_MS       70   // s0/s4 cu error mare (Y, tangente)
+#define JCT_ARM_WIDEN_MS      45   // linia se "lateste": centru + lateral oricare
+#define JCT_CONFIRM_MS        15   // confirmare suplimentara impotriva glitch-urilor
 #define JCT_MIN_DIST_MM      100   // distanta minima parcursa intre 2 junctions
 #define JCT_ENTRY_MIN_MS     220
 #define JCT_ENTRY_MAX_MS     320
 #define JCT_TURN_SPEED        40
 #define JCT_COOLDOWN_MS      700   // redus de la 900
 #define JCT_ERR_JUMP         900   // saritura brusca de eroare = bifurcatie Y (era 1100)
+#define JCT_ERR_JUMP_MS       25
+#define JCT_DECISION_MIN_REAL_EXITS 2  // minim 2 iesiri reale ca sa consumam turns[]
 
 // ============ ODOMETRIE (fara encoderi - bazata pe PWM*timp) ============
 // Calibrare: la ~PWM 40 robotul merge cu ~85 mm/s.
@@ -114,13 +120,17 @@
 // ============ Turn execution ============
 #define TURN_L_MS            430
 #define TURN_R_MS            320
+#define TURN_ALIGN_MIN_MS    160
+#define TURN_ALIGN_CONFIRM_MS 45
+#define TURN_ALIGN_TIMEOUT_MS 900
 #define COMMIT_DRIVE_MS      180
 
 // ============ Recovery ============
 #define UTURN_MIN_MS         700
 #define UTURN_STOP_MS        180
 #define LOST_GRACE_MS        450
-#define STUCK_MAX_MS       18000
+#define ENABLE_STUCK_WATCHDOG 0
+#define STUCK_MAX_MS       30000
 
 // ============ Misc ============
 #define MOVE_LOG_SIZE         14
@@ -230,6 +240,10 @@ char jct_exit_actions[MAX_JUNCTION_EXITS] = {'B', 0, 0, 0};
 char jct_exit_labels[20] = "0B";
 uint8_t jct_exit_count = 1;
 int8_t jct_selected_exit = -1;
+bool jct_consumes_plan = false;
+bool jct_turn_aligned = false;
+unsigned long jct_align_seen_since = 0;
+unsigned long jct_commit_start = 0;
 
 // --- Prototypes ---
 void PCF8574Write(byte data);
@@ -241,12 +255,13 @@ void showStatus();
 bool snapshotHasLineAhead();
 bool sweepSampleHasLine();
 bool scanLineConfirmed(unsigned long now);
+bool turnAlignmentLineSeen();
 void resetJunctionRefs();
 void buildExitTable();
 void updateExitLabels();
 void finalizeEvidence();
 void prepareJunctionChoice(unsigned long now);
-char actionFromTurn(int t);
+char actionFromTurnIndex(int t);
 bool joystickPressEdge();
 void waitJoystickRelease();
 long readVccMilliVolts();
@@ -313,16 +328,16 @@ void logMove(char m) {
 
 bool snapshotHasLineAhead() {
   bool c  = sensorValues[2] > CENTER_BLACK;
-  bool l1 = sensorValues[1] > BLACK_THRESHOLD;
-  bool r1 = sensorValues[3] > BLACK_THRESHOLD;
+  bool l1 = sensorValues[1] > JCT_INNER_THRESHOLD;
+  bool r1 = sensorValues[3] > JCT_INNER_THRESHOLD;
   return c && (l1 || r1);
 }
 bool sweepSampleHasLine() {
-  bool s0 = sensorValues[0] > SIDE_BLACK;
-  bool s1 = sensorValues[1] > BLACK_THRESHOLD;
+  bool s0 = sensorValues[0] > JCT_SIDE_THRESHOLD;
+  bool s1 = sensorValues[1] > JCT_INNER_THRESHOLD;
   bool s2 = sensorValues[2] > CENTER_BLACK;
-  bool s3 = sensorValues[3] > BLACK_THRESHOLD;
-  bool s4 = sensorValues[4] > SIDE_BLACK;
+  bool s3 = sensorValues[3] > JCT_INNER_THRESHOLD;
+  bool s4 = sensorValues[4] > JCT_SIDE_THRESHOLD;
   int black = (s0?1:0)+(s1?1:0)+(s2?1:0)+(s3?1:0)+(s4?1:0);
   bool left_edge   = s0 && s1;
   bool left_inner  = s1 && s2;
@@ -340,6 +355,19 @@ bool scanLineConfirmed(unsigned long now) {
   return jct_scan_latched;
 }
 
+bool turnAlignmentLineSeen() {
+  bool c = sensorValues[2] > CENTER_BLACK;
+  bool near_left = sensorValues[1] > JCT_INNER_THRESHOLD;
+  bool near_right = sensorValues[3] > JCT_INNER_THRESHOLD;
+  int black = 0;
+  for (int k = 0; k < NUM_SENSORS; k++) {
+    if (sensorValues[k] > CP_BLACK_THRESHOLD) black++;
+  }
+
+  // Nu oprim rotatia pe un patrat/checkpoint sau pe miezul gros al intersectiei.
+  return c && (near_left || near_right || sensorValues[2] > BLACK_THRESHOLD) && black <= 3;
+}
+
 void resetJunctionRefs() {
   jct_saw_entry_corners = false;
   jct_scan_seen_since = 0;
@@ -351,6 +379,10 @@ void resetJunctionRefs() {
   jct_choice = '?';
   jct_selected_exit = -1;
   jct_execute_ms = 0;
+  jct_consumes_plan = false;
+  jct_turn_aligned = false;
+  jct_align_seen_since = 0;
+  jct_commit_start = 0;
   for (int i = 0; i < MAX_JUNCTION_EXITS; i++) jct_exit_actions[i] = 0;
   jct_exit_actions[0] = 'B';
   jct_exit_count = 1;
@@ -397,15 +429,22 @@ char actionFromTurnIndex(int t) {
 }
 
 void prepareJunctionChoice(unsigned long now) {
-  // Alege actiunea din secventa daca exista
-  int planned_idx = (moves_seq_idx < TURNS_LEN) ? turns[moves_seq_idx] : -1;
+  // Consumam secventa doar cand exista cel putin doua iesiri reale
+  // (ex.: T/cross). O singura iesire reala este viraj fortat, nu decizie.
+  uint8_t real_exits = (jct_exit_count > 0) ? (jct_exit_count - 1) : 0;
+  bool decision_node = real_exits >= JCT_DECISION_MIN_REAL_EXITS;
+  int planned_idx = (decision_node && moves_seq_idx < TURNS_LEN) ? turns[moves_seq_idx] : -1;
   char chosen;
-  if (planned_idx < 0) {
-    // fara plan: prefera prima iesire reala (1), sau B daca nu exista
+  if (!decision_node) {
+    // Drum fara alegere: ia singura iesire reala, sau intoarce daca e capat.
+    chosen = (jct_exit_count >= 2) ? jct_exit_actions[1] : 'B';
+  } else if (planned_idx < 0) {
+    // Nod cu alegere, dar fara plan ramas: prefera cea mai din stanga.
     chosen = (jct_exit_count >= 2) ? jct_exit_actions[1] : 'B';
   } else {
     chosen = actionFromTurnIndex(planned_idx);
   }
+  jct_consumes_plan = decision_node && planned_idx >= 0;
 
   jct_choice = chosen;
   // Marker exit selectat (pentru OLED)
@@ -418,13 +457,16 @@ void prepareJunctionChoice(unsigned long now) {
   else if (chosen == 'R') jct_execute_ms = TURN_R_MS + COMMIT_DRIVE_MS;
   else if (chosen == 'F') jct_execute_ms = COMMIT_DRIVE_MS;
   else                    jct_execute_ms = UTURN_MIN_MS;
+  jct_turn_aligned = false;
+  jct_align_seen_since = 0;
+  jct_commit_start = 0;
 
   last_event_time = now;
 #if DEBUG_JUNCTION_STOP
   robotState = ST_JCT_STOP;
 #else
   logMove(chosen);
-  if (moves_seq_idx < TURNS_LEN) moves_seq_idx++;
+  if (jct_consumes_plan) moves_seq_idx++;
   robotState = (chosen == 'B') ? ST_UTURN : ST_JCT_EXECUTE;
 #endif
   stateEnterTime = now;
@@ -528,7 +570,9 @@ void showStatus() {
     display.setCursor(0, 48);
     display.print(F("Seq:")); display.print(moves_seq_idx);
     display.print(F("/")); display.print(TURNS_LEN);
-    display.print(F(" ")); display.print(jct_choice);
+    if (jct_consumes_plan) display.print(F(" P:"));
+    else display.print(F(" A:"));
+    display.print(jct_choice);
     display.setCursor(0, 56);
     if (robotState == ST_JCT_STOP) display.print(F("Press JOY"));
     else {
@@ -689,14 +733,18 @@ void loop() {
   static int prev_error = 0;
   static unsigned long err_jump_since = 0;
   int err_delta = abs(error - prev_error);
-  if (err_delta >= JCT_ERR_JUMP) { if (err_jump_since == 0) err_jump_since = now; }
-  else if (now - err_jump_since > 100) err_jump_since = 0;
+  bool err_jump_now = line_visible && !dense_black && (err_delta >= JCT_ERR_JUMP);
+  if (err_jump_now) { if (err_jump_since == 0) err_jump_since = now; }
+  else if (err_jump_since != 0 && (now - err_jump_since) > 100) err_jump_since = 0;
   prev_error = error;
 
   // ===== Trackere trigger junction =====
-  // side: lateral + centru (T-uri si cross-uri clasice)
-  if ((s0 || s1) && s2) { if (left_arm_since == 0) left_arm_since = now; } else left_arm_since = 0;
-  if ((s4 || s3) && s2) { if (right_arm_since == 0) right_arm_since = now; } else right_arm_since = 0;
+  // side: exterior + linie apropiata (T-uri si cross-uri clasice).
+  // Nu folosim s1/s3 singuri aici, altfel o linie lata devine fals "intersectie".
+  bool left_branch_shape = s0 && (s1 || s2);
+  bool right_branch_shape = s4 && (s3 || s2);
+  if (left_branch_shape) { if (left_arm_since == 0) left_arm_since = now; } else left_arm_since = 0;
+  if (right_branch_shape) { if (right_arm_since == 0) right_arm_since = now; } else right_arm_since = 0;
   // dense: 4-5 negri (cu prag normal)
   if (sensors_black >= 4) { if (dense_since == 0) dense_since = now; } else dense_since = 0;
   // edge: doar lateral cu error mare (Y-uri, tangente)
@@ -712,7 +760,7 @@ void loop() {
   bool arm_dense      = dense_since     && (now - dense_since)     >= (JCT_ARM_DENSE_MS + JCT_CONFIRM_MS);
   bool arm_edge_l     = edge_left_since && (now - edge_left_since) >= (JCT_ARM_EDGE_MS + JCT_CONFIRM_MS);
   bool arm_edge_r     = edge_right_since && (now - edge_right_since) >= (JCT_ARM_EDGE_MS + JCT_CONFIRM_MS);
-  bool arm_err_jump   = err_jump_since != 0;
+  bool arm_err_jump   = err_jump_since && (now - err_jump_since) >= JCT_ERR_JUMP_MS;
   bool arm_widen      = widen_since && (now - widen_since) >= JCT_ARM_WIDEN_MS;
 
   // Gating intre 2 intersectii (anti-rebound)
@@ -756,7 +804,7 @@ void loop() {
   bool obstacle_blocking = (obstacle_seen_since != 0) && ((now - obstacle_seen_since) >= OBSTACLE_DEBOUNCE_MS);
 
   // Stuck watchdog
-  if (robotState == ST_NORMAL && (now - last_event_time) > STUCK_MAX_MS) {
+  if (ENABLE_STUCK_WATCHDOG && robotState == ST_NORMAL && !line_visible && (now - last_event_time) > STUCK_MAX_MS) {
     logMove('U'); last_event_time = now;
     robotState = ST_UTURN; stateEnterTime = now;
   }
@@ -831,8 +879,7 @@ void loop() {
         checkpoint_count++;
         checkpoint_lockout_until = now + CP_LOCKOUT_MS;
         logMove('C');
-        // CP-ul corespunde unui nod din path => consuma o intrare din turns[]
-        if (moves_seq_idx < TURNS_LEN) moves_seq_idx++;
+        // Checkpoint-ul nu consuma turns[]: lista este doar pentru intersectii.
 #if ENABLE_ODOMETRY
         odo_dist_at_last_jct = odo_dist_mm;
 #endif
@@ -844,8 +891,8 @@ void loop() {
     }
 
     case ST_CP_CONFIRMED: {
-      // Mergi drept pana iesi din patrat (cp_black_count <= 2 cu pragul relaxat)
-      if (cp_black_count <= 2) {
+      // Mergi drept pana iesi din patrat.
+      if (cp_black_count <= CP_EXIT_BLACK_MAX) {
         // Verifica daca avem inca linie de centru pe care sa continuam
         bool has_line = s2 || (sensorValues[1] > BLACK_THRESHOLD) || (sensorValues[3] > BLACK_THRESHOLD);
         if (has_line) {
@@ -960,13 +1007,38 @@ void loop() {
     case ST_JCT_STOP:
       if ((now - stateEnterTime) > JOY_MIN_HOLD_MS && joystickPressEdge()) {
         logMove(jct_choice);
-        if (moves_seq_idx < TURNS_LEN) moves_seq_idx++;
+        if (jct_consumes_plan) moves_seq_idx++;
         robotState = (jct_choice == 'B') ? ST_UTURN : ST_JCT_EXECUTE;
         stateEnterTime = now; last_event_time = now;
       }
       break;
     case ST_JCT_EXECUTE:
-      if ((now - stateEnterTime) > jct_execute_ms) {
+      if (jct_choice == 'L' || jct_choice == 'R') {
+        unsigned long t = now - stateEnterTime;
+        if (!jct_turn_aligned) {
+          bool can_accept_line = t >= TURN_ALIGN_MIN_MS;
+          if (can_accept_line && turnAlignmentLineSeen()) {
+            if (jct_align_seen_since == 0) jct_align_seen_since = now;
+            if ((now - jct_align_seen_since) >= TURN_ALIGN_CONFIRM_MS) {
+              jct_turn_aligned = true;
+              jct_commit_start = now;
+              integral = 0;
+              last_error = 0;
+            }
+          } else {
+            jct_align_seen_since = 0;
+          }
+
+          if (!jct_turn_aligned && t >= TURN_ALIGN_TIMEOUT_MS) {
+            jct_turn_aligned = true;
+            jct_commit_start = now;
+            integral = 0;
+            last_error = 0;
+          }
+        } else if ((now - jct_commit_start) >= COMMIT_DRIVE_MS) {
+          robotState = ST_NORMAL; stateEnterTime = now; last_event_time = now;
+        }
+      } else if ((now - stateEnterTime) > jct_execute_ms) {
         robotState = ST_NORMAL; stateEnterTime = now; last_event_time = now;
       }
       break;
@@ -1046,12 +1118,11 @@ void loop() {
     case ST_JCT_CENTER_SCAN_2: left_speed = 0; right_speed = 0; led_color = 0xAA44FF; break;
     case ST_JCT_STOP: left_speed = 0; right_speed = 0; led_color = 0x0000FF; break;
     case ST_JCT_EXECUTE: {
-      unsigned long t = now - stateEnterTime;
       if (jct_choice == 'L') {
-        if (t < TURN_L_MS) { left_speed = -JCT_TURN_SPEED; right_speed = JCT_TURN_SPEED; led_color = 0x00FFFF; }
+        if (!jct_turn_aligned) { left_speed = -JCT_TURN_SPEED; right_speed = JCT_TURN_SPEED; led_color = 0x00FFFF; }
         else { left_speed = right_speed = INTERSECTION_SPEED; led_color = 0xFFFFFF; }
       } else if (jct_choice == 'R') {
-        if (t < TURN_R_MS) { left_speed = JCT_TURN_SPEED; right_speed = -JCT_TURN_SPEED; led_color = 0xFFFF00; }
+        if (!jct_turn_aligned) { left_speed = JCT_TURN_SPEED; right_speed = -JCT_TURN_SPEED; led_color = 0xFFFF00; }
         else { left_speed = right_speed = INTERSECTION_SPEED; led_color = 0xFFFFFF; }
       } else { left_speed = right_speed = INTERSECTION_SPEED; led_color = 0xFFFFFF; }
       break;
