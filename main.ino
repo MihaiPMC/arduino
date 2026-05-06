@@ -19,6 +19,8 @@
      si checkpoint-urile nu muta indexul secventei.
    - Virajele stanga/dreapta se opresc cand linia noua este regasita,
      cu timeout de siguranta, nu doar dupa timp fix.
+   - Scanarea iesirilor ignora pata neagra groasa din mijlocul intersectiei
+     si cauta o linie subtire/stabila pe directia scanata.
 
   Conventie secventa:
     0 = u-turn (intoarcere prin ramura din spate)
@@ -89,7 +91,7 @@
 // Pe linii reale, s0/s4 nu ating mereu 600 cand intra ramura - cu 420 prindem mult mai repede.
 #define JCT_SIDE_THRESHOLD   420
 #define JCT_INNER_THRESHOLD  500   // pt s1/s3 (inner) la detectie laterala
-#define JCT_ARM_SIDE_MS       45   // s0+s2 sau s4+s2 stabil
+#define JCT_ARM_SIDE_MS       45   // ramura pe s0/s4 + linie apropiata stabila
 #define JCT_ARM_DENSE_MS      55   // 4-5 negri pentru cross/Y
 #define JCT_ARM_EDGE_MS       70   // s0/s4 cu error mare (Y, tangente)
 #define JCT_ARM_WIDEN_MS      45   // linia se "lateste": centru + lateral oricare
@@ -116,11 +118,14 @@
 #define JCT_SETTLE_MS        140
 #define JCT_SCAN_MS          180
 #define JCT_LINE_CONFIRM_MS   70
+#define JCT_SCAN_BLACK_MAX     3   // peste 3 senzori negri = centru/pata, nu iesire clara
+#define JCT_SPLIT_DIAGONAL_EXITS 0 // 1 daca traseul are si 45 si 90 pe aceeasi parte
 
 // ============ Turn execution ============
 #define TURN_L_MS            430
 #define TURN_R_MS            320
-#define TURN_ALIGN_MIN_MS    160
+#define TURN_DIAG_ALIGN_MIN_MS 140
+#define TURN_HARD_ALIGN_MARGIN_MS 80
 #define TURN_ALIGN_CONFIRM_MS 45
 #define TURN_ALIGN_TIMEOUT_MS 900
 #define COMMIT_DRIVE_MS      180
@@ -139,7 +144,7 @@
 #define SHOW_ODOMETRY_ON_OLED  0   // UNO are RAM putin; 0 = afisaj sigur ca inainte
 #define JOY_DEBOUNCE_MS       30
 #define JOY_MIN_HOLD_MS      150
-#define MAX_JUNCTION_EXITS     4
+#define MAX_JUNCTION_EXITS     6   // B + < + L + F + R + >
 
 // ====================================================
 // SECVENTA DE IESIRI (injectata de UI-ul web prin downloadIno)
@@ -231,13 +236,15 @@ bool ref_left45        = false;
 bool ref_left90        = false;
 bool ref_right45       = false;
 bool ref_right90       = false;
+bool jct_hint_L = false;
+bool jct_hint_R = false;
 bool jct_arm_L = false;
 bool jct_arm_F = false;
 bool jct_arm_R = false;
 char jct_choice = '?';
 unsigned long jct_execute_ms = 0;
-char jct_exit_actions[MAX_JUNCTION_EXITS] = {'B', 0, 0, 0};
-char jct_exit_labels[20] = "0B";
+char jct_exit_actions[MAX_JUNCTION_EXITS] = {'B', 0, 0, 0, 0, 0};
+char jct_exit_labels[24] = "0B";
 uint8_t jct_exit_count = 1;
 int8_t jct_selected_exit = -1;
 bool jct_consumes_plan = false;
@@ -253,9 +260,12 @@ void setMotors(int left, int right);
 void logMove(char m);
 void showStatus();
 bool snapshotHasLineAhead();
-bool sweepSampleHasLine();
+bool scanExitSampleHasLine();
 bool scanLineConfirmed(unsigned long now);
 bool turnAlignmentLineSeen();
+bool actionTurnsLeft(char action);
+bool actionTurnsRight(char action);
+unsigned int minAlignMsForAction(char action);
 void resetJunctionRefs();
 void buildExitTable();
 void updateExitLabels();
@@ -330,23 +340,31 @@ bool snapshotHasLineAhead() {
   bool c  = sensorValues[2] > CENTER_BLACK;
   bool l1 = sensorValues[1] > JCT_INNER_THRESHOLD;
   bool r1 = sensorValues[3] > JCT_INNER_THRESHOLD;
-  return c && (l1 || r1);
+  int relaxed_black = 0;
+  for (int k = 0; k < NUM_SENSORS; k++) {
+    if (sensorValues[k] > CP_BLACK_THRESHOLD) relaxed_black++;
+  }
+  return c && (l1 || r1) && relaxed_black <= JCT_SCAN_BLACK_MAX;
 }
-bool sweepSampleHasLine() {
+bool scanExitSampleHasLine() {
   bool s0 = sensorValues[0] > JCT_SIDE_THRESHOLD;
   bool s1 = sensorValues[1] > JCT_INNER_THRESHOLD;
   bool s2 = sensorValues[2] > CENTER_BLACK;
   bool s3 = sensorValues[3] > JCT_INNER_THRESHOLD;
   bool s4 = sensorValues[4] > JCT_SIDE_THRESHOLD;
-  int black = (s0?1:0)+(s1?1:0)+(s2?1:0)+(s3?1:0)+(s4?1:0);
-  bool left_edge   = s0 && s1;
-  bool left_inner  = s1 && s2;
-  bool right_inner = s2 && s3;
-  bool right_edge  = s3 && s4;
-  return left_edge || left_inner || right_inner || right_edge || black >= 3;
+  int relaxed_black = 0;
+  for (int k = 0; k < NUM_SENSORS; k++) {
+    if (sensorValues[k] > CP_BLACK_THRESHOLD) relaxed_black++;
+  }
+
+  bool thin_enough = relaxed_black > 0 && relaxed_black <= JCT_SCAN_BLACK_MAX;
+  bool centered = s2 && (s1 || s3 || sensorValues[2] > BLACK_THRESHOLD);
+  bool adjacent_pair = (s0 && s1) || (s1 && s2) || (s2 && s3) || (s3 && s4);
+
+  return thin_enough && (centered || adjacent_pair);
 }
 bool scanLineConfirmed(unsigned long now) {
-  if (sweepSampleHasLine()) {
+  if (scanExitSampleHasLine()) {
     if (jct_scan_seen_since == 0) jct_scan_seen_since = now;
     if ((now - jct_scan_seen_since) >= JCT_LINE_CONFIRM_MS) jct_scan_latched = true;
   } else {
@@ -365,7 +383,22 @@ bool turnAlignmentLineSeen() {
   }
 
   // Nu oprim rotatia pe un patrat/checkpoint sau pe miezul gros al intersectiei.
-  return c && (near_left || near_right || sensorValues[2] > BLACK_THRESHOLD) && black <= 3;
+  return c && (near_left || near_right || sensorValues[2] > BLACK_THRESHOLD) &&
+         black <= JCT_SCAN_BLACK_MAX;
+}
+
+bool actionTurnsLeft(char action) {
+  return action == '<' || action == 'L';
+}
+
+bool actionTurnsRight(char action) {
+  return action == 'R' || action == '>';
+}
+
+unsigned int minAlignMsForAction(char action) {
+  if (action == '<') return TURN_L_MS - TURN_HARD_ALIGN_MARGIN_MS;
+  if (action == '>') return TURN_R_MS - TURN_HARD_ALIGN_MARGIN_MS;
+  return TURN_DIAG_ALIGN_MIN_MS;
 }
 
 void resetJunctionRefs() {
@@ -375,6 +408,7 @@ void resetJunctionRefs() {
   ref_center_before = false; ref_center_mid = false; ref_center_after = false;
   ref_left45 = false; ref_left90 = false;
   ref_right45 = false; ref_right90 = false;
+  jct_hint_L = false; jct_hint_R = false;
   jct_arm_L = false; jct_arm_F = false; jct_arm_R = false;
   jct_choice = '?';
   jct_selected_exit = -1;
@@ -392,9 +426,34 @@ void resetJunctionRefs() {
 void buildExitTable() {
   jct_exit_count = 0;
   jct_exit_actions[jct_exit_count++] = 'B';
-  if (jct_arm_L && jct_exit_count < MAX_JUNCTION_EXITS) jct_exit_actions[jct_exit_count++] = 'L';
+
+#if JCT_SPLIT_DIAGONAL_EXITS
+  if (ref_left90 && jct_exit_count < MAX_JUNCTION_EXITS) jct_exit_actions[jct_exit_count++] = '<';
+  if (ref_left45 && jct_exit_count < MAX_JUNCTION_EXITS) jct_exit_actions[jct_exit_count++] = 'L';
+  if (jct_hint_L && !ref_left90 && !ref_left45 &&
+      jct_exit_count < MAX_JUNCTION_EXITS) {
+    jct_exit_actions[jct_exit_count++] = 'L';
+  }
+#else
+  if (jct_arm_L && jct_exit_count < MAX_JUNCTION_EXITS) {
+    jct_exit_actions[jct_exit_count++] = ref_left90 ? '<' : 'L';
+  }
+#endif
+
   if (jct_arm_F && jct_exit_count < MAX_JUNCTION_EXITS) jct_exit_actions[jct_exit_count++] = 'F';
-  if (jct_arm_R && jct_exit_count < MAX_JUNCTION_EXITS) jct_exit_actions[jct_exit_count++] = 'R';
+
+#if JCT_SPLIT_DIAGONAL_EXITS
+  if (ref_right45 && jct_exit_count < MAX_JUNCTION_EXITS) jct_exit_actions[jct_exit_count++] = 'R';
+  if (ref_right90 && jct_exit_count < MAX_JUNCTION_EXITS) jct_exit_actions[jct_exit_count++] = '>';
+  if (jct_hint_R && !ref_right45 && !ref_right90 &&
+      jct_exit_count < MAX_JUNCTION_EXITS) {
+    jct_exit_actions[jct_exit_count++] = 'R';
+  }
+#else
+  if (jct_arm_R && jct_exit_count < MAX_JUNCTION_EXITS) {
+    jct_exit_actions[jct_exit_count++] = ref_right90 ? '>' : 'R';
+  }
+#endif
 }
 void updateExitLabels() {
   int w = 0;
@@ -408,8 +467,8 @@ void updateExitLabels() {
 }
 void finalizeEvidence() {
   int center_hits = (ref_center_before?1:0) + (ref_center_mid?1:0) + (ref_center_after?1:0);
-  jct_arm_L = ref_left45 || ref_left90;
-  jct_arm_R = ref_right45 || ref_right90;
+  jct_arm_L = jct_hint_L || ref_left45 || ref_left90;
+  jct_arm_R = jct_hint_R || ref_right45 || ref_right90;
   jct_arm_F = center_hits >= 2;
   buildExitTable();
   updateExitLabels();
@@ -419,8 +478,10 @@ void finalizeEvidence() {
 // Conventie noua:
 //   turns[i] = 0       -> u-turn (intotdeauna disponibil, indexul 0 din tabel)
 //   turns[i] = N >= 1  -> a N-a iesire detectata, sortata stanga -> dreapta
-// jct_exit_actions[] are: [0]='B', [1..count-1]= iesirile reale L/F/R in ordinea
-// stanga -> dreapta (vezi buildExitTable). Deci putem folosi indexul direct.
+// jct_exit_actions[] are: [0]='B', apoi iesirile reale in ordinea:
+// '<' stanga 90, 'L' stanga oblic, 'F' fata, 'R' dreapta oblic, '>' dreapta 90.
+// Cu JCT_SPLIT_DIAGONAL_EXITS=0, scanarile 45/90 de pe aceeasi parte se unesc
+// ca sa nu dubleze aceeasi ramura lata.
 char actionFromTurnIndex(int t) {
   if (t <= 0) return 'B';
   if (t < (int)jct_exit_count) return jct_exit_actions[t];
@@ -453,8 +514,8 @@ void prepareJunctionChoice(unsigned long now) {
     if (jct_exit_actions[i] == chosen) { jct_selected_exit = i; break; }
   }
 
-  if (chosen == 'L')      jct_execute_ms = TURN_L_MS + COMMIT_DRIVE_MS;
-  else if (chosen == 'R') jct_execute_ms = TURN_R_MS + COMMIT_DRIVE_MS;
+  if (actionTurnsLeft(chosen))  jct_execute_ms = TURN_ALIGN_TIMEOUT_MS + COMMIT_DRIVE_MS;
+  else if (actionTurnsRight(chosen)) jct_execute_ms = TURN_ALIGN_TIMEOUT_MS + COMMIT_DRIVE_MS;
   else if (chosen == 'F') jct_execute_ms = COMMIT_DRIVE_MS;
   else                    jct_execute_ms = UTURN_MIN_MS;
   jct_turn_aligned = false;
@@ -827,8 +888,12 @@ void loop() {
         stateEnterTime = now;
       }
       else if (jct_armed) {
+        bool hint_left = arm_left_side || arm_edge_l || (arm_widen && s0);
+        bool hint_right = arm_right_side || arm_edge_r || (arm_widen && s4);
         integral = 0; last_error = 0;
         resetJunctionRefs();
+        jct_hint_L = hint_left;
+        jct_hint_R = hint_right;
 #if ENABLE_ODOMETRY
         odo_dist_at_last_jct = odo_dist_mm;
 #endif
@@ -866,8 +931,12 @@ void loop() {
                               (now - cp_last_seen) > CP_GLITCH_GRACE_MS;
       if (cp_lost_too_long) {
         // A fost doar tranzitie (ex. cross). Trecem la junction logic.
+        bool hint_left = arm_left_side || arm_edge_l || (arm_widen && s0);
+        bool hint_right = arm_right_side || arm_edge_r || (arm_widen && s4);
         cp_dense_since = 0;
         resetJunctionRefs();
+        jct_hint_L = hint_left;
+        jct_hint_R = hint_right;
 #if ENABLE_ODOMETRY
         odo_dist_at_last_jct = odo_dist_mm;
 #endif
@@ -924,11 +993,15 @@ void loop() {
 
     case ST_JCT_ENTRY:
       if (s0 || s4) jct_saw_entry_corners = true;
-      if (((now - stateEnterTime) >= JCT_ENTRY_MIN_MS && jct_saw_entry_corners && !s0 && !s4) ||
+      {
+        bool exited_entry_blob = jct_saw_entry_corners && !s0 && !s4;
+        if (((now - stateEnterTime) >= JCT_ENTRY_MIN_MS && exited_entry_blob) ||
           ((now - stateEnterTime) >= JCT_ENTRY_MAX_MS)) {
-        ref_center_before = snapshotHasLineAhead() || sweepSampleHasLine();
-        jct_scan_seen_since = 0; jct_scan_latched = false;
-        robotState = ST_JCT_L45_TURN; stateEnterTime = now;
+          ref_center_before = exited_entry_blob &&
+                              (snapshotHasLineAhead() || scanExitSampleHasLine());
+          jct_scan_seen_since = 0; jct_scan_latched = false;
+          robotState = ST_JCT_L45_TURN; stateEnterTime = now;
+        }
       }
       break;
     case ST_JCT_L45_TURN:
@@ -1013,10 +1086,10 @@ void loop() {
       }
       break;
     case ST_JCT_EXECUTE:
-      if (jct_choice == 'L' || jct_choice == 'R') {
+      if (actionTurnsLeft(jct_choice) || actionTurnsRight(jct_choice)) {
         unsigned long t = now - stateEnterTime;
         if (!jct_turn_aligned) {
-          bool can_accept_line = t >= TURN_ALIGN_MIN_MS;
+          bool can_accept_line = t >= minAlignMsForAction(jct_choice);
           if (can_accept_line && turnAlignmentLineSeen()) {
             if (jct_align_seen_since == 0) jct_align_seen_since = now;
             if ((now - jct_align_seen_since) >= TURN_ALIGN_CONFIRM_MS) {
@@ -1118,10 +1191,10 @@ void loop() {
     case ST_JCT_CENTER_SCAN_2: left_speed = 0; right_speed = 0; led_color = 0xAA44FF; break;
     case ST_JCT_STOP: left_speed = 0; right_speed = 0; led_color = 0x0000FF; break;
     case ST_JCT_EXECUTE: {
-      if (jct_choice == 'L') {
+      if (actionTurnsLeft(jct_choice)) {
         if (!jct_turn_aligned) { left_speed = -JCT_TURN_SPEED; right_speed = JCT_TURN_SPEED; led_color = 0x00FFFF; }
         else { left_speed = right_speed = INTERSECTION_SPEED; led_color = 0xFFFFFF; }
-      } else if (jct_choice == 'R') {
+      } else if (actionTurnsRight(jct_choice)) {
         if (!jct_turn_aligned) { left_speed = JCT_TURN_SPEED; right_speed = -JCT_TURN_SPEED; led_color = 0xFFFF00; }
         else { left_speed = right_speed = INTERSECTION_SPEED; led_color = 0xFFFFFF; }
       } else { left_speed = right_speed = INTERSECTION_SPEED; led_color = 0xFFFFFF; }
