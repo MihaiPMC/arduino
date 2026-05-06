@@ -84,7 +84,8 @@
 #define CP_GLITCH_GRACE_MS    40   // toleranta scurta cand un senzor pierde negrul
 #define CP_EXIT_BLACK_MAX      2   // <=2 senzori negri => iesit din patrat
 #define CP_LOCKOUT_MS       1500   // dupa CP, ignora alte detectii
-#define CP_MAX_DURATION_MS  2500   // siguranta: dupa atat, considera iesit
+#define CP_MAX_DURATION_MS  6000   // patratul de checkpoint poate fi mare
+#define CP_REACQUIRE_MS     1200   // dupa patrat, mergi drept pana regasesti linia
 
 // ============ JUNCTION (multi-modal, MAI SENSIBIL) ============
 // Prag separat pentru senzorii laterali la detectie junction (mai relaxat decat SIDE_BLACK=600).
@@ -138,6 +139,15 @@
 #define TURN_RIGHT_135_MAX_MS 600
 #define TURN_ALIGN_CONFIRM_MS 45
 #define COMMIT_DRIVE_MS      180
+
+// ============ Circle / tight curve following ============
+#define CIRCLE_INNER_SPEED     12
+#define CIRCLE_OUTER_SPEED     40
+
+// ============ Calibration ============
+#define CALIBRATION_PWM        42
+#define CALIBRATION_SAMPLES   130
+#define CALIBRATION_DELAY_MS    8
 
 // ============ Recovery ============
 #define UTURN_MIN_MS         700
@@ -225,6 +235,7 @@ unsigned long edge_right_since = 0;
 unsigned long cp_dense_since = 0;
 unsigned long cp_last_seen = 0;
 unsigned long cp_enter_time = 0;
+unsigned long cp_exit_time = 0;
 
 // ===== junction snapshots =====
 bool jct_saw_entry_corners = false;
@@ -552,10 +563,10 @@ void setup() {
   RGB.show();
   delay(500);
 
-  // Calibrare TRSensors (rotire stanga-dreapta)
-  analogWrite(PWMA, 65); analogWrite(PWMB, 65);
-  for (int i = 0; i < 100; i++) {
-    if (i < 25 || i >= 75) {
+  // Calibrare TRSensors (rotire stanga-dreapta lenta, ca sa nu sara de pe traseu)
+  analogWrite(PWMA, CALIBRATION_PWM); analogWrite(PWMB, CALIBRATION_PWM);
+  for (int i = 0; i < CALIBRATION_SAMPLES; i++) {
+    if (i < (CALIBRATION_SAMPLES / 4) || i >= (3 * CALIBRATION_SAMPLES / 4)) {
       digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW);
       digitalWrite(BIN1, LOW);  digitalWrite(BIN2, HIGH);
     } else {
@@ -563,7 +574,7 @@ void setup() {
       digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW);
     }
     trs.calibrate();
-    delay(5);
+    delay(CALIBRATION_DELAY_MS);
   }
   setMotors(0, 0);
 
@@ -606,7 +617,7 @@ void setup() {
   robotState = ST_NORMAL;
   integral = 0; last_error = 0;
   recent_side = 0;
-  cp_dense_since = 0; cp_last_seen = 0;
+  cp_dense_since = 0; cp_last_seen = 0; cp_exit_time = 0;
   left_arm_since = 0; right_arm_since = 0;
   dense_since = 0; edge_left_since = 0; edge_right_since = 0;
   // 4) Beep + LED verde scurt ca semnal vizibil de "GO"
@@ -660,18 +671,21 @@ void loop() {
   // ===== Trackere trigger junction =====
   // side: exterior + linie apropiata (T-uri si cross-uri clasice).
   // Nu folosim s1/s3 singuri aici, altfel o linie lata devine fals "intersectie".
-  bool left_branch_shape = s0 && (s1 || s2);
-  bool right_branch_shape = s4 && (s3 || s2);
+  bool left_branch_shape = s0 && s2;
+  bool right_branch_shape = s4 && s2;
+  bool left_curve_edge = (s0 || s1) && !s2 && !s3 && !s4;
+  bool right_curve_edge = (s4 || s3) && !s2 && !s1 && !s0;
   if (left_branch_shape) { if (left_arm_since == 0) left_arm_since = now; } else left_arm_since = 0;
   if (right_branch_shape) { if (right_arm_since == 0) right_arm_since = now; } else right_arm_since = 0;
   // dense: 4-5 negri (cu prag normal)
   if (sensors_black >= 4) { if (dense_since == 0) dense_since = now; } else dense_since = 0;
   // edge: doar lateral cu error mare (Y-uri, tangente)
-  if (s0 && abs(error) > 500) { if (edge_left_since == 0) edge_left_since = now; } else edge_left_since = 0;
-  if (s4 && abs(error) > 500) { if (edge_right_since == 0) edge_right_since = now; } else edge_right_since = 0;
+  if (!left_curve_edge && s0 && abs(error) > 500) { if (edge_left_since == 0) edge_left_since = now; } else edge_left_since = 0;
+  if (!right_curve_edge && s4 && abs(error) > 500) { if (edge_right_since == 0) edge_right_since = now; } else edge_right_since = 0;
   // NOU: widen - linia "se lateste". Centru vizibil + oricare lateral activ
   static unsigned long widen_since = 0;
-  bool widen_now = s2 && (s0 || s4);
+  bool curve_widen = s2 && ((s0 && !s3 && !s4) || (s4 && !s0 && !s1));
+  bool widen_now = s2 && (s0 || s4) && !curve_widen;
   if (widen_now) { if (widen_since == 0) widen_since = now; } else widen_since = 0;
 
   bool arm_left_side  = left_arm_since  && (now - left_arm_since)  >= (JCT_ARM_SIDE_MS + JCT_CONFIRM_MS);
@@ -797,6 +811,7 @@ void loop() {
         // CP confirmat
         checkpoint_count++;
         checkpoint_lockout_until = now + CP_LOCKOUT_MS;
+        cp_exit_time = 0;
         logMove('C');
         // Checkpoint-ul nu consuma turns[]: lista este doar pentru intersectii.
 #if ENABLE_ODOMETRY
@@ -810,20 +825,21 @@ void loop() {
     }
 
     case ST_CP_CONFIRMED: {
-      // Mergi drept pana iesi din patrat.
+      // Mergi drept peste patrat, apoi continua scurt pana regasesti linia.
       if (cp_black_count <= CP_EXIT_BLACK_MAX) {
-        // Verifica daca avem inca linie de centru pe care sa continuam
-        bool has_line = s2 || (sensorValues[1] > BLACK_THRESHOLD) || (sensorValues[3] > BLACK_THRESHOLD);
+        if (cp_exit_time == 0) cp_exit_time = now;
+        bool has_line = s2 || (sensorValues[1] > JCT_INNER_THRESHOLD) ||
+                        (sensorValues[3] > JCT_INNER_THRESHOLD);
         if (has_line) {
+          cp_exit_time = 0;
           robotState = ST_NORMAL; stateEnterTime = now; last_event_time = now;
-        } else {
-          // Capat de drum sau iesire stranga -> uturn
-          logMove('U'); last_event_time = now;
-          robotState = ST_UTURN; stateEnterTime = now;
+        } else if ((now - cp_exit_time) > CP_REACQUIRE_MS) {
+          cp_exit_time = 0;
+          robotState = ST_LOST; stateEnterTime = now; last_event_time = now;
         }
       } else if ((now - stateEnterTime) > CP_MAX_DURATION_MS) {
-        // safety
-        robotState = ST_NORMAL; stateEnterTime = now; last_event_time = now;
+        // Daca patratul e foarte mare, nu intra in U-turn: mergi mai departe cautand linia.
+        cp_exit_time = now;
       }
       break;
     }
@@ -913,6 +929,16 @@ void loop() {
   switch (robotState) {
     case ST_NORMAL:
       if (dense_black) { left_speed = right_speed = INTERSECTION_SPEED; }
+      else if (error < -PIVOT_THRESHOLD && (s0 || s1)) {
+        left_speed = CIRCLE_INNER_SPEED;
+        right_speed = CIRCLE_OUTER_SPEED;
+        led_color = 0x00AAFF;
+      }
+      else if (error > PIVOT_THRESHOLD && (s4 || s3)) {
+        left_speed = CIRCLE_OUTER_SPEED;
+        right_speed = CIRCLE_INNER_SPEED;
+        led_color = 0x00AAFF;
+      }
       else if (abs(error) > PIVOT_THRESHOLD) {
         int p = SHARP_PIVOT_SPEED;
         if (error > 0) { left_speed =  p; right_speed = -p; }
