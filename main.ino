@@ -586,8 +586,6 @@ void setup() {
   }
 
   resetJunctionRefs();
-  buildExitTable();
-  updateExitLabels();
   showStatus();
   delay(500);
   waitJoystickRelease();
