@@ -79,7 +79,7 @@
 // ============ CHECKPOINT (PATRAT NEGRU PLIN) - imbunatatit ============
 #define CP_BLACK_THRESHOLD 500  // prag mai relaxat decat BLACK_THRESHOLD (patrat are reflexe variabile)
 #define CP_APPROACH_BLACK_COUNT 3
-#define CP_APPROACH_MS 95       // asteapta mai mult ca T/cross sa poata fi prins ca intersectie
+#define CP_APPROACH_MS 35       // intra rapid in verificare CP; daca e +/T revine prin pending junction
 #define CP_MIN_BLACK_COUNT 4    // 4 din 5 senzori negri = pe patrat (era 5 strict)
 #define CP_FULL_MS 180          // durata totala pentru confirmare (redusa - era 220)
 #define CP_SETTLE_MS 120        // intra putin mai mult in patrat inainte de decizie
@@ -161,8 +161,8 @@
 #define UTURN_STOP_MS 180
 #define CP_UTURN_ADVANCE_SPEED 20
 #define CP_UTURN_ADVANCE_MS 280
-#define CP_UTURN_SPEED 34
-#define CP_UTURN_PIVOT_MS 1180
+#define CP_UTURN_SPEED 30
+#define CP_UTURN_PIVOT_MS 980
 #define CP_UTURN_MIN_MS 420
 #define CP_UTURN_MAX_MS 1400
 #define CP_UTURN_STOP_MS 0
@@ -255,6 +255,7 @@ unsigned long cp_entry_last_seen = 0;
 unsigned long cp_dense_since = 0;
 unsigned long cp_last_seen = 0;
 unsigned long cp_exit_time = 0;
+bool cp_jct_pending = false;
 
 // ===== junction snapshots =====
 bool jct_saw_entry_corners = false;
@@ -812,6 +813,7 @@ void setup()
   cp_dense_since = 0;
   cp_last_seen = 0;
   cp_exit_time = 0;
+  cp_jct_pending = false;
   left_arm_since = 0;
   right_arm_since = 0;
   dense_since = 0;
@@ -904,8 +906,8 @@ void loop()
   // ===== Trackere trigger junction =====
   // side: exterior + linie apropiata (T-uri si cross-uri clasice).
   // Pentru Y folosim s1+s3 impreuna, dar doar daca nu seamana cu patrat/checkpoint.
-  bool left_branch_shape = !dense_square_like && s0 && (s1 || s2);
-  bool right_branch_shape = !dense_square_like && s4 && (s3 || s2);
+  bool left_branch_shape = s0 && (s1 || s2);
+  bool right_branch_shape = s4 && (s3 || s2);
   bool left_curve_edge = (s0 || s1) && !s2 && !s3 && !s4;
   bool right_curve_edge = (s4 || s3) && !s2 && !s1 && !s0;
   bool y_fork_shape = !cp_pad_seen && !dense_black && s1 && s3 &&
@@ -1014,6 +1016,8 @@ void loop()
   bool cp_allowed = now >= checkpoint_lockout_until;
   bool cp_tracking_state = (robotState == ST_NORMAL || robotState == ST_LOST ||
                             robotState == ST_CP_CANDIDATE);
+  if (cp_tracking_state && jct_armed)
+    cp_jct_pending = true;
   if (cp_allowed && cp_tracking_state)
   {
     if (cp_entry_seen)
@@ -1045,6 +1049,7 @@ void loop()
     cp_entry_last_seen = 0;
     cp_dense_since = 0;
     cp_last_seen = 0;
+    cp_jct_pending = false;
   }
   bool cp_prelim = cp_allowed && cp_dense_since && ((now - cp_dense_since) >= CP_APPROACH_MS);
 
@@ -1172,6 +1177,7 @@ void loop()
       cp_entry_last_seen = 0;
       cp_dense_since = 0;
       cp_last_seen = 0;
+      cp_jct_pending = false;
 #if ENABLE_ODOMETRY
       odo_dist_at_last_jct = odo_dist_mm;
 #endif
@@ -1190,14 +1196,16 @@ void loop()
 #if ENABLE_ODOMETRY
       odo_dist_at_last_jct = odo_dist_mm;
 #endif
-      if (jct_armed || arm_left_side || arm_right_side || arm_dense ||
+      if (cp_jct_pending || jct_armed || arm_left_side || arm_right_side || arm_dense ||
           arm_edge_l || arm_edge_r || arm_widen || arm_err_jump || arm_fork ||
           arm_shallow_l || arm_shallow_r)
       {
+        cp_jct_pending = false;
         robotState = ST_JCT_ENTRY;
       }
       else
       {
+        cp_jct_pending = false;
         robotState = line_visible ? ST_NORMAL : ST_LOST;
       }
       stateEnterTime = now;
