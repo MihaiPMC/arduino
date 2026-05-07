@@ -166,61 +166,51 @@
 #define JOY_MIN_HOLD_MS 150
 
 // ====================================================
-// RUTE SEGMENTE
-// Editeaza DOAR blocurile de mai jos.
-// Fiecare segment = de la un checkpoint la urmatorul.
-// A = ruta principala, B = ruta backup (la obstacol).
-// Directii: 0=spate 2=stanga 4=fata 6=dreapta
-//            1=sp-st 3=fa-st 5=fa-dr 7=sp-dr
+// RUTE — editeaza DOAR aceasta sectiune
+// Linii perechi: A (principala), B (backup), A, B, A, B...
+// Fiecare pereche = un segment (start→CP1, CP1→CP2, etc.)
+// 0 = terminator de ruta (nu il folosi ca directie in mijloc!)
+// Directii: 2=stanga  4=fata  6=dreapta
+//            1=sp-st   3=fa-st  5=fa-dr  7=sp-dr
+// Max 15 directii per ruta.
 // ====================================================
-
-// --- Segment 0: Start → Checkpoint 1 ---
-const int seg0A[] = { 4, 6, 4 };   // <-- modifica
-const int seg0B[] = { 2, 4, 6 };   // <-- modifica
-
-// --- Segment 1: Checkpoint 1 → Checkpoint 2 ---
-const int seg1A[] = { 4, 4 };      // <-- modifica
-const int seg1B[] = { 6, 4, 2 };   // <-- modifica
-
-// --- Adauga segmente noi dupa acelasi model ---
-// const int seg2A[] = { ... };
-// const int seg2B[] = { ... };
-
-// ====================================================
-// INDEX SEGMENTE — inregistreaza fiecare segment aici
-// ====================================================
-#define ARR_LEN(a) ((int)(sizeof(a)/sizeof(a[0])))
-struct SegmentDef { const int* a; int alen; const int* b; int blen; };
-const SegmentDef SEGMENTS[] = {
-  { seg0A, ARR_LEN(seg0A), seg0B, ARR_LEN(seg0B) },
-  { seg1A, ARR_LEN(seg1A), seg1B, ARR_LEN(seg1B) },
-  // { seg2A, ARR_LEN(seg2A), seg2B, ARR_LEN(seg2B) },
+// <AI:routes>
+#define MAX_ROUTE_TURNS 16
+const int8_t ROUTES[][MAX_ROUTE_TURNS] = {
+  {2, 4, 0},          // seg 1 ruta A: start → CP1
+  {4, 2, 2, 6, 0},    // seg 1 ruta B: start → CP1 backup
+  {4, 2, 4, 0},       // seg 2 ruta A: CP1 → CP2
+  {2, 6, 2, 0},       // seg 2 ruta B: CP1 → CP2 backup
+  {2, 0},             // seg 3 ruta A: CP2 → CP3
+  {2, 0},             // seg 3 ruta B: CP2 → CP3 backup
 };
-const int NUM_SEGMENTS = ARR_LEN(SEGMENTS);
+// </AI:routes>
+#define ARR_LEN(a) ((int)(sizeof(a)/sizeof(a[0])))
+const int NUM_ROUTES   = ARR_LEN(ROUTES); // trebuie sa fie par
+const int NUM_SEGMENTS = NUM_ROUTES / 2;
 
 // ====================================================
 // Stare navigatie
 // ====================================================
-#define MAX_ROUTE_TURNS 30  // max turns per route
-#define NAV_PRIMARY 0   // urmeaza ruta A
-#define NAV_RETURN  1   // se intoarce dupa obstacol
-#define NAV_BACKUP  2   // urmeaza ruta B
-#define NAV_DONE    3   // all segments completed
-#define NAV_ERROR   4   // obstacol si pe B → stop
+#define NAV_PRIMARY 0
+#define NAV_RETURN  1
+#define NAV_BACKUP  2
+#define NAV_DONE    3
+#define NAV_ERROR   4
 
-uint8_t  nav_mode         = NAV_PRIMARY;
-uint8_t  nav_segment      = 0;     // segmentul curent
-const int* nav_route      = nullptr;
-int      nav_route_len    = 0;
-int      nav_route_idx    = 0;     // pozitia curenta in ruta activa
+uint8_t  nav_mode        = NAV_PRIMARY;
+uint8_t  nav_segment     = 0;
+const int8_t* nav_route  = nullptr;
+int      nav_route_len   = 0;
+int      nav_route_idx   = 0;
 
-// Viraje completate in leg-ul curent (pt a construi ruta de intoarcere)
+// Viraje completate in leg-ul curent (pt ruta de intoarcere)
 int8_t   nav_done_turns[MAX_ROUTE_TURNS];
-uint8_t  nav_done_count   = 0;
+uint8_t  nav_done_count  = 0;
 
-// Ruta de intoarcere (construita dinamic la obstacol)
+// Ruta de intoarcere (construita dinamic)
 int8_t   nav_return_buf[MAX_ROUTE_TURNS];
-uint8_t  nav_return_len   = 0;
+uint8_t  nav_return_len  = 0;
 
 // ====================================================
 Adafruit_SSD1306 display(128, 64, &Wire, OLED_RESET);
@@ -549,20 +539,29 @@ static int mirrorTurn(int t)
   }
 }
 
+// Calculeaza lungimea rutei (pana la primul 0 terminator).
+static int routeLen(const int8_t* r)
+{
+  int n = 0;
+  while (n < MAX_ROUTE_TURNS && r[n] != 0)
+    n++;
+  return n;
+}
+
 void navActivatePrimary(uint8_t seg)
 {
-  nav_route     = SEGMENTS[seg].a;
-  nav_route_len = SEGMENTS[seg].alen;
-  nav_route_idx = 0;
+  nav_route      = ROUTES[seg * 2];
+  nav_route_len  = routeLen(nav_route);
+  nav_route_idx  = 0;
   nav_done_count = 0;
   nav_mode = NAV_PRIMARY;
 }
 
 void navActivateBackup(uint8_t seg)
 {
-  nav_route     = SEGMENTS[seg].b;
-  nav_route_len = SEGMENTS[seg].blen;
-  nav_route_idx = 0;
+  nav_route      = ROUTES[seg * 2 + 1];
+  nav_route_len  = routeLen(nav_route);
+  nav_route_idx  = 0;
   nav_done_count = 0;
   nav_mode = NAV_BACKUP;
 }
@@ -586,9 +585,7 @@ int navGetNextTurn()
     return DIR_FRONT;
   if (nav_mode == NAV_RETURN)
     return (int)nav_return_buf[nav_route_idx];
-  if (nav_route != nullptr)
-    return nav_route[nav_route_idx];
-  return DIR_FRONT;
+  return (nav_route != nullptr) ? (int)nav_route[nav_route_idx] : DIR_FRONT;
 }
 
 bool navHasMoreTurns()
