@@ -5,33 +5,20 @@
    (TRSensors, OLED SSD1306, NeoPixel, PCF8574 joystick + IR,
     motor driver standard AlphaBot2-Ar).
 
-  NOTE LOGICA:
-   - Detectie checkpoint robusta: PATRAT NEGRU PLIN.
-     Un patrat se distinge de un cross junction prin DURATA
-     in care toti 5 senzori vad negru continuu (>= CP_FULL_MS).
-   - Detectie junction multi-modala: T, Y, cross, curbe stranse,
-     cercuri tangente. Mai multe trigger-uri independente,
-     fara cerinta de "error stable" (care bloca pe curbe).
-   - Eliminat ST_JCT_CP_VERIFY (cauza dubla numarare CP).
-   - turns[] foloseste 8 directii relative fixe:
-     0=spate, 1=stanga-jos, 2=stanga, 3=stanga-sus,
-     4=fata/sus, 5=dreapta-sus, 6=dreapta, 7=dreapta-jos.
-   - turns[] se consuma la fiecare nod detectat: intersectie sau checkpoint.
-     Daca un checkpoint are 0 in turns[], robotul intoarce pe loc.
-   - Virajele stanga/dreapta se opresc cand linia noua este regasita,
-     cu timeout de siguranta, nu doar dupa timp fix.
-   - La intersectie nu mai scanam toate muchiile. Robotul cauta doar directia
-     primita din turns[].
+  NAVIGATIE SEGMENTE CU REROUTING:
+   - Traseul e impartit in segmente: start→CP1, CP1→CP2, ...
+   - Fiecare segment are DOUA rute: A (principala) si B (backup).
+   - Robotul urmeaza ruta A. Daca intalneste un obstacol (IR):
+       1. Se opreste si face U-turn pe loc.
+       2. Se intoarce pe ruta inversa pana la checkpoint-ul safe anterior.
+       3. Porneste pe ruta B spre urmatorul checkpoint.
+   - Daca obstacol si pe ruta B → ST_ERROR (oprire cu LED rosu).
+   - Detectie CP: patrat negru plin (4/5 senzori >= CP_FULL_MS).
+   - Detectie junction multi-modala: T, Y, cross, curbe, tangente.
 
-  Conventie secventa:
-    0 = spate / jos
-    1 = stanga-jos
-    2 = stanga
-    3 = stanga-sus
-    4 = fata / sus
-    5 = dreapta-sus
-    6 = dreapta
-    7 = dreapta-jos
+  Conventie directii:
+    0=spate  2=stanga  4=fata  6=dreapta
+    1=spate-stanga  3=fata-stanga  5=fata-dreapta  7=spate-dreapta
 */
 
 #include <Adafruit_NeoPixel.h>
@@ -111,7 +98,7 @@
 #define JCT_ERR_JUMP 900    // saritura brusca de eroare = bifurcatie Y (era 1100)
 #define JCT_ERR_JUMP_MS 25
 
-// ============ Directii relative primite din turns[] ============
+// ============ Directii relative (executie viraj) ============
 #define DIR_BACK 0
 #define DIR_BACK_LEFT 1
 #define DIR_LEFT 2
@@ -179,14 +166,61 @@
 #define JOY_MIN_HOLD_MS 150
 
 // ====================================================
-// SECVENTA DE IESIRI (injectata de UI-ul web prin downloadIno)
-// 0=spate, 1=stanga-jos, 2=stanga, 3=stanga-sus,
-// 4=fata/sus, 5=dreapta-sus, 6=dreapta, 7=dreapta-jos.
+// RUTE SEGMENTE
+// Editeaza DOAR blocurile de mai jos.
+// Fiecare segment = de la un checkpoint la urmatorul.
+// A = ruta principala, B = ruta backup (la obstacol).
+// Directii: 0=spate 2=stanga 4=fata 6=dreapta
+//            1=sp-st 3=fa-st 5=fa-dr 7=sp-dr
 // ====================================================
-// <AI:turns_array>
-const int turns[] = {6, 3, 3, 6, 0, 2, 5, 5, 6, 3, 3}; ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// </AI:turns_array>
-const int TURNS_LEN = sizeof(turns) / sizeof(turns[0]);
+
+// --- Segment 0: Start → Checkpoint 1 ---
+const int seg0A[] = { 4, 6, 4 };   // <-- modifica
+const int seg0B[] = { 2, 4, 6 };   // <-- modifica
+
+// --- Segment 1: Checkpoint 1 → Checkpoint 2 ---
+const int seg1A[] = { 4, 4 };      // <-- modifica
+const int seg1B[] = { 6, 4, 2 };   // <-- modifica
+
+// --- Adauga segmente noi dupa acelasi model ---
+// const int seg2A[] = { ... };
+// const int seg2B[] = { ... };
+
+// ====================================================
+// INDEX SEGMENTE — inregistreaza fiecare segment aici
+// ====================================================
+#define ARR_LEN(a) ((int)(sizeof(a)/sizeof(a[0])))
+struct SegmentDef { const int* a; int alen; const int* b; int blen; };
+const SegmentDef SEGMENTS[] = {
+  { seg0A, ARR_LEN(seg0A), seg0B, ARR_LEN(seg0B) },
+  { seg1A, ARR_LEN(seg1A), seg1B, ARR_LEN(seg1B) },
+  // { seg2A, ARR_LEN(seg2A), seg2B, ARR_LEN(seg2B) },
+};
+const int NUM_SEGMENTS = ARR_LEN(SEGMENTS);
+
+// ====================================================
+// Stare navigatie
+// ====================================================
+#define MAX_ROUTE_TURNS 30  // max turns per route
+#define NAV_PRIMARY 0   // urmeaza ruta A
+#define NAV_RETURN  1   // se intoarce dupa obstacol
+#define NAV_BACKUP  2   // urmeaza ruta B
+#define NAV_DONE    3   // all segments completed
+#define NAV_ERROR   4   // obstacol si pe B → stop
+
+uint8_t  nav_mode         = NAV_PRIMARY;
+uint8_t  nav_segment      = 0;     // segmentul curent
+const int* nav_route      = nullptr;
+int      nav_route_len    = 0;
+int      nav_route_idx    = 0;     // pozitia curenta in ruta activa
+
+// Viraje completate in leg-ul curent (pt a construi ruta de intoarcere)
+int8_t   nav_done_turns[MAX_ROUTE_TURNS];
+uint8_t  nav_done_count   = 0;
+
+// Ruta de intoarcere (construita dinamic la obstacol)
+int8_t   nav_return_buf[MAX_ROUTE_TURNS];
+uint8_t  nav_return_len   = 0;
 
 // ====================================================
 Adafruit_SSD1306 display(128, 64, &Wire, OLED_RESET);
@@ -207,7 +241,7 @@ unsigned long last_event_time = 0;
 unsigned long checkpoint_lockout_until = 0;
 unsigned long obstacle_seen_since = 0;
 int checkpoint_count = 0;
-int moves_seq_idx = 0;
+// moves_seq_idx eliminat — navigatia se face prin nav_route_idx
 char move_log[MOVE_LOG_SIZE + 1] = {0};
 int move_log_count = 0;
 unsigned long live_left_run = 0;
@@ -229,13 +263,15 @@ enum RobotState
 {
   ST_NORMAL,
   ST_LOST,
-  ST_CP_CANDIDATE, // NOU: testeaza durata 5/5 negru
-  ST_CP_CONFIRMED, // NOU: numara, iese din patrat
-  ST_CP_STOP,      // optional: stop+joy dupa CP
+  ST_CP_CANDIDATE,
+  ST_CP_CONFIRMED,
+  ST_CP_STOP,
   ST_UTURN,
   ST_JCT_ENTRY,
   ST_JCT_STOP,
-  ST_JCT_EXECUTE
+  ST_JCT_EXECUTE,
+  ST_DONE,   // toate segmentele complete
+  ST_ERROR   // obstacol si pe ruta B
 };
 RobotState robotState = ST_NORMAL;
 
@@ -289,6 +325,14 @@ unsigned int maxAlignMsForDirection(int dir);
 char directionLogChar(int dir);
 void resetJunctionRefs();
 void resetArmTimers();
+int  navGetNextTurn();
+bool navHasMoreTurns();
+void navRecordTurn(int dir);
+void navActivatePrimary(uint8_t seg);
+void navActivateBackup(uint8_t seg);
+void navActivateReturn();
+void navOnObstacle(unsigned long now);
+void navOnCheckpointReached(unsigned long now);
 void prepareJunctionChoice(unsigned long now, bool from_checkpoint);
 void prepareCheckpointChoice(unsigned long now);
 bool joystickPressEdge();
@@ -489,40 +533,160 @@ void resetArmTimers()
   prev_error = 0;
 }
 
+// ============ Navigatie segmente ============
+
+static int mirrorTurn(int t)
+{
+  switch (t)
+  {
+  case DIR_LEFT:        return DIR_RIGHT;
+  case DIR_RIGHT:       return DIR_LEFT;
+  case DIR_FRONT_LEFT:  return DIR_FRONT_RIGHT;
+  case DIR_FRONT_RIGHT: return DIR_FRONT_LEFT;
+  case DIR_BACK_LEFT:   return DIR_BACK_RIGHT;
+  case DIR_BACK_RIGHT:  return DIR_BACK_LEFT;
+  default:              return t; // FRONT si BACK raman
+  }
+}
+
+void navActivatePrimary(uint8_t seg)
+{
+  nav_route     = SEGMENTS[seg].a;
+  nav_route_len = SEGMENTS[seg].alen;
+  nav_route_idx = 0;
+  nav_done_count = 0;
+  nav_mode = NAV_PRIMARY;
+}
+
+void navActivateBackup(uint8_t seg)
+{
+  nav_route     = SEGMENTS[seg].b;
+  nav_route_len = SEGMENTS[seg].blen;
+  nav_route_idx = 0;
+  nav_done_count = 0;
+  nav_mode = NAV_BACKUP;
+}
+
+// Construieste ruta de intoarcere si o activeaza.
+void navActivateReturn()
+{
+  nav_return_len = nav_done_count;
+  for (uint8_t i = 0; i < nav_done_count; i++)
+    nav_return_buf[i] = (int8_t)mirrorTurn(nav_done_turns[nav_done_count - 1 - i]);
+  nav_route     = nullptr; // se va folosi nav_return_buf direct
+  nav_route_len = nav_return_len;
+  nav_route_idx = 0;
+  nav_mode = NAV_RETURN;
+}
+
+// Citeste urmatoarea directie din ruta activa.
+int navGetNextTurn()
+{
+  if (nav_route_idx >= nav_route_len)
+    return DIR_FRONT;
+  if (nav_mode == NAV_RETURN)
+    return (int)nav_return_buf[nav_route_idx];
+  if (nav_route != nullptr)
+    return nav_route[nav_route_idx];
+  return DIR_FRONT;
+}
+
+bool navHasMoreTurns()
+{
+  return nav_route_idx < nav_route_len;
+}
+
+// Inregistreaza virajul executat (pentru a putea calcula intoarcerea).
+void navRecordTurn(int dir)
+{
+  if ((nav_mode == NAV_PRIMARY || nav_mode == NAV_BACKUP) &&
+      nav_done_count < MAX_ROUTE_TURNS)
+    nav_done_turns[nav_done_count++] = (int8_t)dir;
+}
+
+// Apelat cand senzorul IR detecteaza un obstacol.
+void navOnObstacle(unsigned long now)
+{
+  if (nav_mode == NAV_BACKUP || nav_mode == NAV_ERROR || nav_mode == NAV_DONE)
+  {
+    // Obstacol si pe ruta B sau stare finala → eroare
+    nav_mode = NAV_ERROR;
+    setMotors(0, 0);
+    robotState = ST_ERROR;
+    stateEnterTime = now;
+    return;
+  }
+  // Pe ruta A (primary) → construieste ruta de intoarcere si fa U-turn
+  navActivateReturn();
+  setMotors(0, 0);
+  delay(OBSTACLE_STOP_MS);
+  logMove('!');
+  uturn_from_checkpoint = false;
+  last_event_time = millis();
+  robotState = ST_UTURN;
+  stateEnterTime = millis();
+  obstacle_seen_since = 0;
+}
+
+// Apelat la fiecare checkpoint detectat.
+void navOnCheckpointReached(unsigned long now)
+{
+  if (nav_mode == NAV_RETURN)
+  {
+    // Revenit la checkpoint-ul safe → activeaza ruta B
+    navActivateBackup(nav_segment);
+    return; // robotul continua drept (ST_CP_CONFIRMED)
+  }
+  // Segment complet (primar sau backup) → trece la urmatorul
+  nav_segment++;
+  if (nav_segment >= (uint8_t)NUM_SEGMENTS)
+  {
+    nav_mode = NAV_DONE;
+    robotState = ST_DONE;
+    stateEnterTime = now;
+  }
+  else
+  {
+    navActivatePrimary(nav_segment);
+  }
+}
+
 void prepareJunctionChoice(unsigned long now, bool from_checkpoint)
 {
-  int planned_dir = (moves_seq_idx < TURNS_LEN) ? turns[moves_seq_idx] : DIR_FRONT;
-  jct_consumes_plan = moves_seq_idx < TURNS_LEN;
+  // Daca ruta de intoarcere s-a epuizat la o intersectie (start fara CP)
+  if (nav_mode == NAV_RETURN && !navHasMoreTurns())
+    navActivateBackup(nav_segment);
+
+  int planned_dir = navGetNextTurn();
+  jct_consumes_plan = navHasMoreTurns();
   if (!validDirection(planned_dir))
     planned_dir = DIR_FRONT;
+
+  // Inregistreaza virajul in leg-ul curent (pt ruta de intoarcere)
+  if (jct_consumes_plan)
+    navRecordTurn(planned_dir);
+  nav_route_idx++;
 
   jct_target_dir = planned_dir;
   jct_choice = directionLogChar(planned_dir);
   uturn_from_checkpoint = from_checkpoint && planned_dir == DIR_BACK;
 
   if (directionTurnsLeft(planned_dir) || directionTurnsRight(planned_dir))
-  {
     jct_execute_ms = maxAlignMsForDirection(planned_dir) + COMMIT_DRIVE_MS;
-  }
   else if (planned_dir == DIR_FRONT)
-  {
     jct_execute_ms = COMMIT_DRIVE_MS;
-  }
   else
-  {
     jct_execute_ms = UTURN_MIN_MS;
-  }
+
   jct_turn_aligned = false;
   jct_align_seen_since = 0;
   jct_commit_start = 0;
-
   last_event_time = now;
+
 #if DEBUG_JUNCTION_STOP
   robotState = ST_JCT_STOP;
 #else
   logMove(jct_choice);
-  if (jct_consumes_plan)
-    moves_seq_idx++;
   robotState = (planned_dir == DIR_BACK) ? ST_UTURN : ST_JCT_EXECUTE;
 #endif
   stateEnterTime = now;
@@ -530,32 +694,30 @@ void prepareJunctionChoice(unsigned long now, bool from_checkpoint)
 
 void prepareCheckpointChoice(unsigned long now)
 {
-  int planned_dir = (moves_seq_idx < TURNS_LEN) ? turns[moves_seq_idx] : DIR_FRONT;
-  bool consumes_plan = moves_seq_idx < TURNS_LEN;
-  if (!validDirection(planned_dir))
-    planned_dir = DIR_FRONT;
+  // Notifica sistemul de navigatie
+  navOnCheckpointReached(now);
 
-  // Pe checkpoint avem doar doua iesiri reale: inapoi sau inainte peste patrat.
-  if (planned_dir != DIR_BACK)
-    planned_dir = DIR_FRONT;
+  // Daca navOnCheckpointReached a schimbat starea in ST_DONE, oprim
+  if (robotState == ST_DONE)
+    return;
+
+  // La checkpoint mergem intotdeauna inainte (nu luam turns din ruta pentru CP)
+  int planned_dir = DIR_FRONT;
 
   jct_target_dir = planned_dir;
   jct_choice = directionLogChar(planned_dir);
-  jct_consumes_plan = consumes_plan;
+  jct_consumes_plan = false;
   jct_execute_ms = 0;
   jct_turn_aligned = false;
   jct_align_seen_since = 0;
   jct_commit_start = 0;
-  uturn_from_checkpoint = planned_dir == DIR_BACK;
+  uturn_from_checkpoint = false;
 
-  logMove(jct_choice);
-  if (jct_consumes_plan)
-    moves_seq_idx++;
-
+  logMove('C');
   cp_exit_time = 0;
   last_event_time = now;
   stateEnterTime = now;
-  robotState = (planned_dir == DIR_BACK) ? ST_UTURN : ST_CP_CONFIRMED;
+  robotState = ST_CP_CONFIRMED;
 }
 
 // ============ Joystick / IR / battery (identic) ============
@@ -649,6 +811,12 @@ void printStateCode()
   case ST_JCT_EXECUTE:
     display.print(F("JEX"));
     break;
+  case ST_DONE:
+    display.print(F("DON"));
+    break;
+  case ST_ERROR:
+    display.print(F("ERR"));
+    break;
   }
 }
 
@@ -673,23 +841,27 @@ void showStatus()
     display.print(F("0B 1BL 2L 3FL"));
     display.setCursor(0, 36);
     display.print(F("4F 5FR 6R 7BR"));
-    display.setCursor(0, 48);
-    display.print(F("Seq:"));
-    display.print(moves_seq_idx);
+    display.setCursor(0, 36);
+    static const char* mnames[] = {"A","RET","B","DONE","ERR"};
+    display.print(F("Ruta:"));
+    display.print(mnames[nav_mode > 4 ? 4 : nav_mode]);
+    display.print(F(" Seg:"));
+    display.print(nav_segment + 1);
     display.print(F("/"));
-    display.print(TURNS_LEN);
-    if (jct_consumes_plan)
-      display.print(F(" P:"));
-    else
-      display.print(F(" A:"));
+    display.print(NUM_SEGMENTS);
+    display.setCursor(0, 48);
+    display.print(F("Idx:"));
+    display.print(nav_route_idx);
+    display.print(F("/"));
+    display.print(nav_route_len);
+    display.print(F(" D:"));
     display.print(jct_choice);
     display.setCursor(0, 56);
     if (robotState == ST_JCT_STOP)
       display.print(F("Press JOY"));
     else
-    {
-      display.print(F("Target only"));
-    }
+      display.print(F("Dir:"));
+      display.print(jct_target_dir);
   }
   else
   {
@@ -697,23 +869,21 @@ void showStatus()
     display.setCursor(82, 2);
     display.print(checkpoint_count);
     display.setTextSize(1);
+    display.setCursor(0, 32);
+    static const char* mn[] = {"RutaA","Ret","RutaB","DONE","ERR!"};
+    display.print(mn[nav_mode > 4 ? 4 : nav_mode]);
+    display.print(F(" Seg"));
+    display.print(nav_segment + 1);
+    display.print(F("/"));
+    display.print(NUM_SEGMENTS);
     display.setCursor(0, 42);
     display.print(F("M:"));
     display.print(move_log);
     display.setCursor(0, 56);
-#if ENABLE_ODOMETRY && SHOW_ODOMETRY_ON_OLED
-    display.print(F("X:"));
-    display.print((int)odo_x_mm);
-    display.print(F(" Y:"));
-    display.print((int)odo_y_mm);
-    display.print(F(" T:"));
-    display.print((int)(odo_theta * 57.2958f));
-#else
-    display.print(F("Seq:"));
-    display.print(moves_seq_idx);
+    display.print(F("Idx:"));
+    display.print(nav_route_idx);
     display.print(F("/"));
-    display.print(TURNS_LEN);
-#endif
+    display.print(nav_route_len);
   }
   display.display();
 }
@@ -808,6 +978,13 @@ void setup()
     display.display();
     delay(20);
   }
+
+  // Initializare navigatie segmente
+  nav_segment    = 0;
+  nav_route_idx  = 0;
+  nav_done_count = 0;
+  nav_return_len = 0;
+  navActivatePrimary(0); // porneste pe ruta A a primului segment
 
   resetJunctionRefs();
   showStatus();
@@ -1125,13 +1302,7 @@ void loop()
   case ST_NORMAL:
     if (obstacle_blocking)
     {
-      uturn_from_checkpoint = false;
-      setMotors(0, 0);
-      delay(OBSTACLE_STOP_MS);
-      logMove('U');
-      last_event_time = millis();
-      robotState = ST_UTURN;
-      stateEnterTime = millis();
+      navOnObstacle(now); // gestioneaza intoarcerea sau eroarea
       obstacle_seen_since = 0;
     }
     // PRIORITATE: CP candidate inainte de junction (un patrat plin
@@ -1171,13 +1342,7 @@ void loop()
   case ST_LOST:
     if (obstacle_blocking)
     {
-      uturn_from_checkpoint = false;
-      setMotors(0, 0);
-      delay(OBSTACLE_STOP_MS);
-      logMove('U');
-      last_event_time = millis();
-      robotState = ST_UTURN;
-      stateEnterTime = millis();
+      navOnObstacle(now);
       obstacle_seen_since = 0;
     }
     else if (cp_prelim)
@@ -1212,7 +1377,7 @@ void loop()
     bool cp_confirm_timeout = (now - stateEnterTime) > CP_CONFIRM_MAX_MS;
     if (cp_confirmed)
     {
-      // CP confirmat. Checkpoint-ul este nod de decizie si consuma turns[].
+      // CP confirmat. Checkpoint-ul = limita de segment.
       checkpoint_count++;
       checkpoint_lockout_until = now + CP_LOCKOUT_MS;
       cp_exit_time = 0;
@@ -1361,11 +1526,10 @@ void loop()
     if ((now - stateEnterTime) > JOY_MIN_HOLD_MS && joystickPressEdge())
     {
       logMove(jct_choice);
-      if (jct_consumes_plan)
-        moves_seq_idx++;
       robotState = (jct_target_dir == DIR_BACK) ? ST_UTURN : ST_JCT_EXECUTE;
       stateEnterTime = now;
       last_event_time = now;
+      waitJoystickRelease();
     }
     break;
   case ST_JCT_EXECUTE:
@@ -1414,6 +1578,12 @@ void loop()
       stateEnterTime = now;
       last_event_time = now;
     }
+    break;
+  }
+
+  case ST_DONE:
+  case ST_ERROR:
+    setMotors(0, 0);
     break;
   }
 
@@ -1590,6 +1760,14 @@ void loop()
     }
     break;
   }
+  case ST_DONE:
+    left_speed = right_speed = 0;
+    led_color = 0x00FF00; // verde = terminat
+    break;
+  case ST_ERROR:
+    left_speed = right_speed = 0;
+    led_color = 0xFF0000; // rosu = eroare
+    break;
   }
 
   setMotors(left_speed, right_speed);
