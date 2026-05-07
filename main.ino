@@ -6,32 +6,20 @@
     motor driver standard AlphaBot2-Ar).
 
   NOTE LOGICA:
-   - Detectie checkpoint robusta: PATRAT NEGRU PLIN.
-     Un patrat se distinge de un cross junction prin DURATA
-     in care toti 5 senzori vad negru continuu (>= CP_FULL_MS).
-   - Detectie junction multi-modala: T, Y, cross, curbe stranse,
-     cercuri tangente. Mai multe trigger-uri independente,
-     fara cerinta de "error stable" (care bloca pe curbe).
-   - Eliminat ST_JCT_CP_VERIFY (cauza dubla numarare CP).
-   - turns[] foloseste 8 directii relative fixe:
-     0=spate, 1=stanga-jos, 2=stanga, 3=stanga-sus,
-     4=fata/sus, 5=dreapta-sus, 6=dreapta, 7=dreapta-jos.
-   - turns[] se consuma la fiecare nod detectat: intersectie sau checkpoint.
-     Daca un checkpoint are 0 in turns[], robotul intoarce pe loc.
+   - Explorare autonoma DFS: robotul construieste o harta topologica a
+     labirintului in memorie si exploreaza fiecare ramura neexplorata.
+   - Detectie checkpoint robusta: PATRAT NEGRU PLIN (4/5 senzori >= CP_FULL_MS).
+   - Detectie junction multi-modala: T, Y, cross, curbe stranse, cercuri tangente.
+   - Heading absolut: 0=N,1=E,2=S,3=W. Actualizat dupa fiecare viraj.
+   - nd_exits[]: 2 biti per directie absoluta (N/E/S/W) = UNKNOWN/OPEN/WALL.
+   - bt_state: BT_NONE=nod nou, BT_DEADEND=intoarcere din fund de sac,
+               BT_POP=intoarcere DFS la parinte.
+   - Senzori IR obstacol: detecteaza pereti in fata inainte de a intra pe drum.
    - Virajele stanga/dreapta se opresc cand linia noua este regasita,
-     cu timeout de siguranta, nu doar dupa timp fix.
-   - La intersectie nu mai scanam toate muchiile. Robotul cauta doar directia
-     primita din turns[].
+     cu timeout de siguranta.
 
-  Conventie secventa:
-    0 = spate / jos
-    1 = stanga-jos
-    2 = stanga
-    3 = stanga-sus
-    4 = fata / sus
-    5 = dreapta-sus
-    6 = dreapta
-    7 = dreapta-jos
+  Directii relative (pt executie viraj):
+    DIR_BACK=0, DIR_LEFT=2, DIR_FRONT=4, DIR_RIGHT=6
 */
 
 #include <Adafruit_NeoPixel.h>
@@ -111,7 +99,7 @@
 #define JCT_ERR_JUMP 900    // saritura brusca de eroare = bifurcatie Y (era 1100)
 #define JCT_ERR_JUMP_MS 25
 
-// ============ Directii relative primite din turns[] ============
+// ============ Directii relative (executie viraj) ============
 #define DIR_BACK 0
 #define DIR_BACK_LEFT 1
 #define DIR_LEFT 2
@@ -120,6 +108,13 @@
 #define DIR_FRONT_RIGHT 5
 #define DIR_RIGHT 6
 #define DIR_BACK_RIGHT 7
+
+// ============ DFS explorare autonoma ============
+#define MAX_NODES 24
+#define DFS_DEPTH 22
+#define EX_UNKNOWN 0
+#define EX_OPEN    1
+#define EX_WALL    2
 
 // ============ ODOMETRIE (fara encoderi - bazata pe PWM*timp) ============
 // Calibrare: la ~PWM 40 robotul merge cu ~85 mm/s.
@@ -179,14 +174,23 @@
 #define JOY_MIN_HOLD_MS 150
 
 // ====================================================
-// SECVENTA DE IESIRI (injectata de UI-ul web prin downloadIno)
-// 0=spate, 1=stanga-jos, 2=stanga, 3=stanga-sus,
-// 4=fata/sus, 5=dreapta-sus, 6=dreapta, 7=dreapta-jos.
+// Harta DFS: nd_exits[i] = 2 biti per directie absoluta
+//   bits[1:0]=N, [3:2]=E, [5:4]=S, [7:6]=W
+//   0=UNKNOWN, 1=OPEN, 2=WALL
 // ====================================================
-// <AI:turns_array>
-const int turns[] = {6, 3, 3, 6, 0, 2, 5, 5, 6, 3, 3}; ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// </AI:turns_array>
-const int TURNS_LEN = sizeof(turns) / sizeof(turns[0]);
+uint8_t nd_exits[MAX_NODES];
+uint8_t nd_flags[MAX_NODES]; // bit0 = checkpoint
+uint8_t nd_count = 0;
+uint8_t dfs_stk[DFS_DEPTH];
+int8_t  dfs_top  = -1;
+uint8_t cur_nd   = 0;
+uint8_t robot_heading = 0; // 0=N,1=E,2=S,3=W
+#define BT_NONE    0
+#define BT_DEADEND 1
+#define BT_POP     2
+uint8_t bt_state = BT_NONE;
+uint8_t dfs_last_abs_dir = 0;
+bool    maze_done = false;
 
 // ====================================================
 Adafruit_SSD1306 display(128, 64, &Wire, OLED_RESET);
@@ -207,9 +211,12 @@ unsigned long last_event_time = 0;
 unsigned long checkpoint_lockout_until = 0;
 unsigned long obstacle_seen_since = 0;
 int checkpoint_count = 0;
-int moves_seq_idx = 0;
 char move_log[MOVE_LOG_SIZE + 1] = {0};
 int move_log_count = 0;
+bool ex_left  = false; // ramura stanga detectata la intrare junction
+bool ex_right = false; // ramura dreapta detectata
+bool ex_front = false; // cale inainte existenta (blob exit)
+bool ex_front_blocked = false; // IR obstacol in fata la blob exit
 unsigned long live_left_run = 0;
 unsigned long live_right_run = 0;
 
@@ -229,13 +236,14 @@ enum RobotState
 {
   ST_NORMAL,
   ST_LOST,
-  ST_CP_CANDIDATE, // NOU: testeaza durata 5/5 negru
-  ST_CP_CONFIRMED, // NOU: numara, iese din patrat
-  ST_CP_STOP,      // optional: stop+joy dupa CP
+  ST_CP_CANDIDATE,
+  ST_CP_CONFIRMED,
+  ST_CP_STOP,
   ST_UTURN,
   ST_JCT_ENTRY,
   ST_JCT_STOP,
-  ST_JCT_EXECUTE
+  ST_JCT_EXECUTE,
+  ST_DONE          // labirint complet explorat
 };
 RobotState robotState = ST_NORMAL;
 
@@ -267,7 +275,6 @@ bool jct_saw_entry_corners = false;
 char jct_choice = '?';
 int jct_target_dir = DIR_FRONT;
 unsigned long jct_execute_ms = 0;
-bool jct_consumes_plan = false;
 bool jct_turn_aligned = false;
 unsigned long jct_align_seen_since = 0;
 unsigned long jct_commit_start = 0;
@@ -289,6 +296,16 @@ unsigned int maxAlignMsForDirection(int dir);
 char directionLogChar(int dir);
 void resetJunctionRefs();
 void resetArmTimers();
+// DFS
+uint8_t getEx(uint8_t nd, uint8_t abs_dir);
+void    setEx(uint8_t nd, uint8_t abs_dir, uint8_t v);
+uint8_t headingLeft();
+uint8_t headingRight();
+uint8_t headingBack();
+void    updateHeadingAfterTurn(int dir);
+void    dfsArriveNewNode(bool is_cp);
+void    dfsMarkExitsFromSensors(bool has_front, bool has_left, bool has_right, bool front_blocked);
+int     dfsChooseDir();
 void prepareJunctionChoice(unsigned long now, bool from_checkpoint);
 void prepareCheckpointChoice(unsigned long now);
 bool joystickPressEdge();
@@ -463,7 +480,6 @@ void resetJunctionRefs()
   jct_choice = '?';
   jct_target_dir = DIR_FRONT;
   jct_execute_ms = 0;
-  jct_consumes_plan = false;
   jct_turn_aligned = false;
   jct_align_seen_since = 0;
   jct_commit_start = 0;
@@ -489,40 +505,149 @@ void resetArmTimers()
   prev_error = 0;
 }
 
+// ============ DFS helpers ============
+uint8_t getEx(uint8_t nd, uint8_t abs_dir)
+{
+  return (nd_exits[nd] >> (abs_dir * 2)) & 0x03;
+}
+void setEx(uint8_t nd, uint8_t abs_dir, uint8_t v)
+{
+  nd_exits[nd] = (nd_exits[nd] & ~(0x03u << (abs_dir * 2))) | ((v & 3u) << (abs_dir * 2));
+}
+uint8_t headingLeft()  { return (robot_heading + 3) & 3; }
+uint8_t headingRight() { return (robot_heading + 1) & 3; }
+uint8_t headingBack()  { return (robot_heading + 2) & 3; }
+
+void updateHeadingAfterTurn(int dir)
+{
+  switch (dir)
+  {
+  case DIR_LEFT:
+  case DIR_FRONT_LEFT:
+    robot_heading = headingLeft();  break;
+  case DIR_RIGHT:
+  case DIR_FRONT_RIGHT:
+    robot_heading = headingRight(); break;
+  case DIR_BACK:
+  case DIR_BACK_LEFT:
+  case DIR_BACK_RIGHT:
+    robot_heading = headingBack();  break;
+  default: break; // DIR_FRONT: fara schimbare
+  }
+}
+
+// Creeaza nod nou si impinge pe stiva DFS.
+// Marcheaza iesirea parintelui (dfs_last_abs_dir) ca OPEN si iesirea
+// "inapoi" a nodului nou ca OPEN.
+void dfsArriveNewNode(bool is_cp)
+{
+  // Marcheaza iesirea parintelui spre acest nod
+  if (dfs_top >= 0)
+    setEx(dfs_stk[dfs_top], dfs_last_abs_dir, EX_OPEN);
+
+  uint8_t new_nd = (nd_count < MAX_NODES) ? nd_count++ : (MAX_NODES - 1);
+  nd_exits[new_nd] = 0;
+  nd_flags[new_nd] = is_cp ? 1 : 0;
+
+  if (dfs_top < DFS_DEPTH - 1)
+    dfs_stk[++dfs_top] = new_nd;
+
+  cur_nd = new_nd;
+  // Back exit = de unde am venit
+  setEx(cur_nd, headingBack(), EX_OPEN);
+}
+
+// Marcheaza iesirile nodului curent pe baza senzorilor capturati.
+// Numai directiile necunoscute sunt actualizate (nu suprascrie OPEN).
+void dfsMarkExitsFromSensors(bool has_front, bool has_left, bool has_right, bool front_blocked)
+{
+  uint8_t abs_f = robot_heading;
+  uint8_t abs_l = headingLeft();
+  uint8_t abs_r = headingRight();
+
+  if ((!has_front || front_blocked) && getEx(cur_nd, abs_f) == EX_UNKNOWN)
+    setEx(cur_nd, abs_f, EX_WALL);
+  if (!has_left && getEx(cur_nd, abs_l) == EX_UNKNOWN)
+    setEx(cur_nd, abs_l, EX_WALL);
+  if (!has_right && getEx(cur_nd, abs_r) == EX_UNKNOWN)
+    setEx(cur_nd, abs_r, EX_WALL);
+}
+
+// Alege directia urmatoare (DFS): prioritate front > left > right > backtrack.
+// Seteaza dfs_last_abs_dir si bt_state.
+int dfsChooseDir()
+{
+  uint8_t abs_f = robot_heading;
+  uint8_t abs_l = headingLeft();
+  uint8_t abs_r = headingRight();
+
+  if (getEx(cur_nd, abs_f) == EX_UNKNOWN) { dfs_last_abs_dir = abs_f; return DIR_FRONT; }
+  if (getEx(cur_nd, abs_l) == EX_UNKNOWN) { dfs_last_abs_dir = abs_l; return DIR_LEFT; }
+  if (getEx(cur_nd, abs_r) == EX_UNKNOWN) { dfs_last_abs_dir = abs_r; return DIR_RIGHT; }
+
+  // Toate iesirile explorate → backtrack la parinte
+  if (dfs_top > 0)
+  {
+    dfs_top--;
+    cur_nd = dfs_stk[dfs_top];
+    bt_state = BT_POP;
+    dfs_last_abs_dir = headingBack();
+    return DIR_BACK;
+  }
+  // La radacina fara iesiri necunoscute → labirint complet
+  maze_done = true;
+  return DIR_FRONT;
+}
+
 void prepareJunctionChoice(unsigned long now, bool from_checkpoint)
 {
-  int planned_dir = (moves_seq_idx < TURNS_LEN) ? turns[moves_seq_idx] : DIR_FRONT;
-  jct_consumes_plan = moves_seq_idx < TURNS_LEN;
-  if (!validDirection(planned_dir))
-    planned_dir = DIR_FRONT;
+  if (bt_state == BT_NONE)
+  {
+    dfsArriveNewNode(from_checkpoint);
+    dfsMarkExitsFromSensors(ex_front, ex_left, ex_right, ex_front_blocked);
+  }
+  else if (bt_state == BT_DEADEND)
+  {
+    // Intoarcere din fund de sac; directia explorata era deja marcata WALL
+    if (nd_count > 0)
+      setEx(cur_nd, dfs_last_abs_dir, EX_WALL);
+    bt_state = BT_NONE;
+  }
+  else // BT_POP
+  {
+    // Revenit la parinte din backtrack DFS
+    bt_state = BT_NONE;
+  }
+
+  int planned_dir = dfsChooseDir();
+
+  if (maze_done)
+  {
+    robotState = ST_DONE;
+    stateEnterTime = now;
+    return;
+  }
 
   jct_target_dir = planned_dir;
   jct_choice = directionLogChar(planned_dir);
-  uturn_from_checkpoint = from_checkpoint && planned_dir == DIR_BACK;
+  uturn_from_checkpoint = from_checkpoint && (planned_dir == DIR_BACK);
 
   if (directionTurnsLeft(planned_dir) || directionTurnsRight(planned_dir))
-  {
     jct_execute_ms = maxAlignMsForDirection(planned_dir) + COMMIT_DRIVE_MS;
-  }
   else if (planned_dir == DIR_FRONT)
-  {
     jct_execute_ms = COMMIT_DRIVE_MS;
-  }
   else
-  {
     jct_execute_ms = UTURN_MIN_MS;
-  }
+
   jct_turn_aligned = false;
   jct_align_seen_since = 0;
   jct_commit_start = 0;
-
   last_event_time = now;
+
 #if DEBUG_JUNCTION_STOP
   robotState = ST_JCT_STOP;
 #else
   logMove(jct_choice);
-  if (jct_consumes_plan)
-    moves_seq_idx++;
   robotState = (planned_dir == DIR_BACK) ? ST_UTURN : ST_JCT_EXECUTE;
 #endif
   stateEnterTime = now;
@@ -530,28 +655,46 @@ void prepareJunctionChoice(unsigned long now, bool from_checkpoint)
 
 void prepareCheckpointChoice(unsigned long now)
 {
-  int planned_dir = (moves_seq_idx < TURNS_LEN) ? turns[moves_seq_idx] : DIR_FRONT;
-  bool consumes_plan = moves_seq_idx < TURNS_LEN;
-  if (!validDirection(planned_dir))
-    planned_dir = DIR_FRONT;
+  // Checkpoint: iesiri doar inainte sau inapoi (nu lateral)
+  if (bt_state == BT_NONE)
+  {
+    dfsArriveNewNode(true);
+    // Checkpoint nu are ramuri laterale
+    dfsMarkExitsFromSensors(true, false, false, false);
+  }
+  else if (bt_state == BT_DEADEND)
+  {
+    if (nd_count > 0)
+      setEx(cur_nd, dfs_last_abs_dir, EX_WALL);
+    bt_state = BT_NONE;
+  }
+  else // BT_POP
+  {
+    bt_state = BT_NONE;
+  }
 
-  // Pe checkpoint avem doar doua iesiri reale: inapoi sau inainte peste patrat.
+  int planned_dir = dfsChooseDir();
+
+  if (maze_done)
+  {
+    robotState = ST_DONE;
+    stateEnterTime = now;
+    return;
+  }
+
+  // Checkpoint permite doar front sau back
   if (planned_dir != DIR_BACK)
     planned_dir = DIR_FRONT;
 
   jct_target_dir = planned_dir;
   jct_choice = directionLogChar(planned_dir);
-  jct_consumes_plan = consumes_plan;
   jct_execute_ms = 0;
   jct_turn_aligned = false;
   jct_align_seen_since = 0;
   jct_commit_start = 0;
-  uturn_from_checkpoint = planned_dir == DIR_BACK;
+  uturn_from_checkpoint = (planned_dir == DIR_BACK);
 
   logMove(jct_choice);
-  if (jct_consumes_plan)
-    moves_seq_idx++;
-
   cp_exit_time = 0;
   last_event_time = now;
   stateEnterTime = now;
@@ -649,6 +792,9 @@ void printStateCode()
   case ST_JCT_EXECUTE:
     display.print(F("JEX"));
     break;
+  case ST_DONE:
+    display.print(F("DON"));
+    break;
   }
 }
 
@@ -667,29 +813,33 @@ void showStatus()
     display.setCursor(0, 12);
     display.print(F("Dir:"));
     display.print(jct_target_dir);
-    display.print(F(" Log:"));
-    display.print(jct_choice);
+    display.print(F(" H:"));
+    static const char* hnames[] = {"N","E","S","W"};
+    display.print(hnames[robot_heading & 3]);
     display.setCursor(0, 24);
-    display.print(F("0B 1BL 2L 3FL"));
-    display.setCursor(0, 36);
-    display.print(F("4F 5FR 6R 7BR"));
-    display.setCursor(0, 48);
-    display.print(F("Seq:"));
-    display.print(moves_seq_idx);
+    display.print(F("Nd:"));
+    display.print(cur_nd);
+    display.print(F(" Stk:"));
+    display.print((int)dfs_top + 1);
     display.print(F("/"));
-    display.print(TURNS_LEN);
-    if (jct_consumes_plan)
-      display.print(F(" P:"));
-    else
-      display.print(F(" A:"));
-    display.print(jct_choice);
+    display.print(nd_count);
+    display.setCursor(0, 36);
+    display.print(F("BT:"));
+    display.print(bt_state);
+    display.print(F(" EX L"));
+    display.print(ex_left);
+    display.print(F("R"));
+    display.print(ex_right);
+    display.print(F("F"));
+    display.print(ex_front);
+    display.setCursor(0, 48);
+    display.print(F("M:"));
+    display.print(move_log);
     display.setCursor(0, 56);
     if (robotState == ST_JCT_STOP)
       display.print(F("Press JOY"));
     else
-    {
-      display.print(F("Target only"));
-    }
+      display.print(F("DFS auto"));
   }
   else
   {
@@ -697,23 +847,24 @@ void showStatus()
     display.setCursor(82, 2);
     display.print(checkpoint_count);
     display.setTextSize(1);
+    display.setCursor(0, 24);
+    display.print(F("Nd:"));
+    display.print(cur_nd);
+    display.print(F("/"));
+    display.print(nd_count);
+    display.print(F(" H:"));
+    static const char* hn[] = {"N","E","S","W"};
+    display.print(hn[robot_heading & 3]);
+    display.setCursor(0, 36);
+    display.print(F("Stk:"));
+    display.print((int)dfs_top + 1);
+    display.print(F(" BT:"));
+    display.print(bt_state);
     display.setCursor(0, 42);
     display.print(F("M:"));
     display.print(move_log);
     display.setCursor(0, 56);
-#if ENABLE_ODOMETRY && SHOW_ODOMETRY_ON_OLED
-    display.print(F("X:"));
-    display.print((int)odo_x_mm);
-    display.print(F(" Y:"));
-    display.print((int)odo_y_mm);
-    display.print(F(" T:"));
-    display.print((int)(odo_theta * 57.2958f));
-#else
-    display.print(F("Seq:"));
-    display.print(moves_seq_idx);
-    display.print(F("/"));
-    display.print(TURNS_LEN);
-#endif
+    display.print(maze_done ? F("MAZE DONE!") : F("Exploring"));
   }
   display.display();
 }
@@ -809,6 +960,18 @@ void setup()
     delay(20);
   }
 
+  // Initializare DFS
+  memset(nd_exits, 0, sizeof(nd_exits));
+  memset(nd_flags, 0, sizeof(nd_flags));
+  nd_count = 0;
+  dfs_top = -1;
+  cur_nd = 0;
+  robot_heading = 0; // start heading Nord
+  bt_state = BT_NONE;
+  dfs_last_abs_dir = 0;
+  maze_done = false;
+  ex_left = ex_right = ex_front = ex_front_blocked = false;
+
   resetJunctionRefs();
   showStatus();
   delay(500);
@@ -816,7 +979,6 @@ void setup()
   unsigned long t_start = millis();
   stateEnterTime = t_start;
   last_event_time = t_start;
-  // === FIX pornire ===
   // 1) Ignora CP in primele 1500ms (robotul poate fi pe patch negru de start)
   checkpoint_lockout_until = t_start + 1500;
   // 2) Reseteaza odometria daca este activata
@@ -1033,11 +1195,13 @@ void loop()
   bool arm_shallow_l = shallow_left_since && (now - shallow_left_since) >= JCT_ARM_SHALLOW_MS;
   bool arm_shallow_r = shallow_right_since && (now - shallow_right_since) >= JCT_ARM_SHALLOW_MS;
 
-  // Gating intre 2 intersectii (anti-rebound)
+  // Gating intre 2 intersectii (anti-rebound).
+  // Bypass cooldown cand DFS se intoarce la un nod existent.
 #if ENABLE_ODOMETRY
-  bool jct_gap_ok = (odo_dist_mm - odo_dist_at_last_jct) >= (float)JCT_MIN_DIST_MM;
+  bool jct_gap_ok = (bt_state != BT_NONE) ||
+                    ((odo_dist_mm - odo_dist_at_last_jct) >= (float)JCT_MIN_DIST_MM);
 #else
-  bool jct_gap_ok = (now - last_event_time) > JCT_COOLDOWN_MS;
+  bool jct_gap_ok = (bt_state != BT_NONE) || ((now - last_event_time) > JCT_COOLDOWN_MS);
 #endif
 
   // Trigger ferm: ORICE modalitate persistenta declanseaza
@@ -1112,6 +1276,9 @@ void loop()
   // Stuck watchdog
   if (ENABLE_STUCK_WATCHDOG && robotState == ST_NORMAL && !line_visible && (now - last_event_time) > STUCK_MAX_MS)
   {
+    if (nd_count > 0)
+      setEx(cur_nd, dfs_last_abs_dir, EX_WALL);
+    bt_state = BT_DEADEND;
     uturn_from_checkpoint = false;
     logMove('U');
     last_event_time = now;
@@ -1125,10 +1292,14 @@ void loop()
   case ST_NORMAL:
     if (obstacle_blocking)
     {
+      // Marcheaza directia curenta ca perete in harta DFS
+      if (nd_count > 0)
+        setEx(cur_nd, robot_heading, EX_WALL);
+      bt_state = BT_DEADEND; // revenim la acelasi nod
       uturn_from_checkpoint = false;
       setMotors(0, 0);
       delay(OBSTACLE_STOP_MS);
-      logMove('U');
+      logMove('O');
       last_event_time = millis();
       robotState = ST_UTURN;
       stateEnterTime = millis();
@@ -1146,14 +1317,14 @@ void loop()
     {
       integral = 0;
       last_error = 0;
+      // Captureaza iesirile detectate de timere inainte de reset
+      ex_left  = arm_left_side || arm_edge_l || arm_shallow_l || arm_fork;
+      ex_right = arm_right_side || arm_edge_r || arm_shallow_r || arm_fork;
+      ex_front = false;
+      ex_front_blocked = false;
       resetJunctionRefs();
       resetArmTimers();
-      // Daca trigger-ul includea senzorii exteriori (s0/s4), colturile au
-      // fost deja vazute inainte de ST_JCT_ENTRY; le marcam direct ca sa
-      // permitem exitul din blob imediat dupa JCT_ENTRY_MIN_MS.
-      if (arm_left_side || arm_edge_l || arm_shallow_l ||
-          arm_right_side || arm_edge_r || arm_shallow_r ||
-          arm_dense || arm_widen)
+      if (ex_left || ex_right || arm_dense || arm_widen)
         jct_saw_entry_corners = true;
 #if ENABLE_ODOMETRY
       odo_dist_at_last_jct = odo_dist_mm;
@@ -1171,10 +1342,13 @@ void loop()
   case ST_LOST:
     if (obstacle_blocking)
     {
+      if (nd_count > 0)
+        setEx(cur_nd, robot_heading, EX_WALL);
+      bt_state = BT_DEADEND;
       uturn_from_checkpoint = false;
       setMotors(0, 0);
       delay(OBSTACLE_STOP_MS);
-      logMove('U');
+      logMove('O');
       last_event_time = millis();
       robotState = ST_UTURN;
       stateEnterTime = millis();
@@ -1193,6 +1367,10 @@ void loop()
     }
     else if ((now - stateEnterTime) > LOST_GRACE_MS)
     {
+      // Fund de sac: marcheaza directia explorata ca perete
+      if (nd_count > 0)
+        setEx(cur_nd, dfs_last_abs_dir, EX_WALL);
+      bt_state = BT_DEADEND;
       uturn_from_checkpoint = false;
       logMove('U');
       last_event_time = now;
@@ -1212,7 +1390,7 @@ void loop()
     bool cp_confirm_timeout = (now - stateEnterTime) > CP_CONFIRM_MAX_MS;
     if (cp_confirmed)
     {
-      // CP confirmat. Checkpoint-ul este nod de decizie si consuma turns[].
+      // CP confirmat. Nod DFS de tip checkpoint.
       checkpoint_count++;
       checkpoint_lockout_until = now + CP_LOCKOUT_MS;
       cp_exit_time = 0;
@@ -1245,7 +1423,11 @@ void loop()
       if (cp_jct_pending || jct_armed)
       {
         cp_jct_pending = false;
-        // Colturile au fost vazute inainte de CP_CANDIDATE (robotul era pe un blob dens)
+        // Blob dens → presupunem ramuri pe ambele parti (mai sigur decat WALL)
+        ex_left  = true;
+        ex_right = true;
+        ex_front = false;
+        ex_front_blocked = false;
         jct_saw_entry_corners = true;
         robotState = ST_JCT_ENTRY;
       }
@@ -1309,6 +1491,7 @@ void loop()
       unsigned long turn_time = now - stateEnterTime;
       if (turn_time >= (CP_UTURN_ADVANCE_MS + CP_UTURN_PIVOT_MS))
       {
+        robot_heading = headingBack();
         uturn_from_checkpoint = false;
         cp_exit_time = 0;
         robotState = ST_NORMAL;
@@ -1327,6 +1510,7 @@ void loop()
     unsigned long turn_time = now - stateEnterTime;
     if (turn_time > (pre_turn_ms + min_ms) && line_ready)
     {
+      robot_heading = headingBack(); // U-turn = 180 grade
       uturn_from_checkpoint = false;
       robotState = ST_NORMAL;
       stateEnterTime = now;
@@ -1335,6 +1519,7 @@ void loop()
     else if (uturn_from_checkpoint && max_ms > 0 &&
              turn_time > (pre_turn_ms + max_ms))
     {
+      robot_heading = headingBack();
       uturn_from_checkpoint = false;
       robotState = cp_pad_seen ? ST_CP_CONFIRMED : ST_NORMAL;
       cp_exit_time = 0;
@@ -1352,6 +1537,9 @@ void loop()
       if (((now - stateEnterTime) >= JCT_ENTRY_MIN_MS && exited_entry_blob) ||
           ((now - stateEnterTime) >= JCT_ENTRY_MAX_MS))
       {
+        // Captureaza daca exista cale inainte (linie centru, fara blob dens)
+        ex_front = s2 && (sensors_black <= 2) && !dense_black;
+        ex_front_blocked = infraredObstacleAhead();
         prepareJunctionChoice(now, false);
       }
     }
@@ -1361,11 +1549,10 @@ void loop()
     if ((now - stateEnterTime) > JOY_MIN_HOLD_MS && joystickPressEdge())
     {
       logMove(jct_choice);
-      if (jct_consumes_plan)
-        moves_seq_idx++;
       robotState = (jct_target_dir == DIR_BACK) ? ST_UTURN : ST_JCT_EXECUTE;
       stateEnterTime = now;
       last_event_time = now;
+      waitJoystickRelease();
     }
     break;
   case ST_JCT_EXECUTE:
@@ -1403,6 +1590,7 @@ void loop()
       }
       else if ((now - jct_commit_start) >= COMMIT_DRIVE_MS)
       {
+        updateHeadingAfterTurn(jct_target_dir);
         robotState = ST_NORMAL;
         stateEnterTime = now;
         last_event_time = now;
@@ -1410,10 +1598,15 @@ void loop()
     }
     else if ((now - stateEnterTime) > jct_execute_ms)
     {
+      updateHeadingAfterTurn(jct_target_dir);
       robotState = ST_NORMAL;
       stateEnterTime = now;
       last_event_time = now;
     }
+    break;
+
+  case ST_DONE:
+    setMotors(0, 0);
     break;
   }
 
@@ -1590,6 +1783,11 @@ void loop()
     }
     break;
   }
+  case ST_DONE:
+    left_speed = 0;
+    right_speed = 0;
+    led_color = 0x00FF00; // verde = terminat
+    break;
   }
 
   setMotors(left_speed, right_speed);
