@@ -106,7 +106,7 @@
 #define JCT_MIN_DIST_MM 100     // distanta minima parcursa intre 2 junctions
 #define JCT_ENTRY_MIN_MS 220
 #define JCT_ENTRY_MAX_MS 320
-#define JCT_TURN_SPEED 40
+#define JCT_TURN_SPEED 34
 #define JCT_COOLDOWN_MS 700 // redus de la 900
 #define JCT_ERR_JUMP 900    // saritura brusca de eroare = bifurcatie Y (era 1100)
 #define JCT_ERR_JUMP_MS 25
@@ -143,8 +143,9 @@
 #define TURN_RIGHT_90_MAX_MS 520
 #define TURN_LEFT_135_MAX_MS 800
 #define TURN_RIGHT_135_MAX_MS 600
-#define TURN_ALIGN_CONFIRM_MS 45
-#define COMMIT_DRIVE_MS 180
+#define TURN_ALIGN_CONFIRM_MS 70
+#define COMMIT_DRIVE_MS 240
+#define COMMIT_CORR_LIMIT 8
 
 // ============ Circle / tight curve following ============
 #define CIRCLE_INNER_SPEED 12
@@ -1506,7 +1507,9 @@ void loop()
       }
       else
       {
-        left_speed = right_speed = INTERSECTION_SPEED;
+        int commit_correction = constrain(correction / 2, -COMMIT_CORR_LIMIT, COMMIT_CORR_LIMIT);
+        left_speed = constrain(INTERSECTION_SPEED + commit_correction, 0, MAX_SPEED);
+        right_speed = constrain(INTERSECTION_SPEED - commit_correction, 0, MAX_SPEED);
         led_color = 0xFFFFFF;
       }
     }
@@ -1520,7 +1523,9 @@ void loop()
       }
       else
       {
-        left_speed = right_speed = INTERSECTION_SPEED;
+        int commit_correction = constrain(correction / 2, -COMMIT_CORR_LIMIT, COMMIT_CORR_LIMIT);
+        left_speed = constrain(INTERSECTION_SPEED + commit_correction, 0, MAX_SPEED);
+        right_speed = constrain(INTERSECTION_SPEED - commit_correction, 0, MAX_SPEED);
         led_color = 0xFFFFFF;
       }
     }
