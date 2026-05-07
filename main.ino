@@ -161,6 +161,7 @@
 #define CP_UTURN_ADVANCE_SPEED 20
 #define CP_UTURN_ADVANCE_MS 280
 #define CP_UTURN_SPEED 34
+#define CP_UTURN_PIVOT_MS 1180
 #define CP_UTURN_MIN_MS 420
 #define CP_UTURN_MAX_MS 1400
 #define CP_UTURN_STOP_MS 0
@@ -1248,6 +1249,20 @@ void loop()
 
   case ST_UTURN:
   {
+    if (uturn_from_checkpoint)
+    {
+      unsigned long turn_time = now - stateEnterTime;
+      if (turn_time >= (CP_UTURN_ADVANCE_MS + CP_UTURN_PIVOT_MS))
+      {
+        uturn_from_checkpoint = false;
+        cp_exit_time = 0;
+        robotState = ST_NORMAL;
+        stateEnterTime = now;
+        last_event_time = now;
+      }
+      break;
+    }
+
     unsigned int pre_turn_ms = uturn_from_checkpoint ? CP_UTURN_ADVANCE_MS : UTURN_STOP_MS;
     unsigned int min_ms = uturn_from_checkpoint ? CP_UTURN_MIN_MS : UTURN_MIN_MS;
     unsigned int max_ms = uturn_from_checkpoint ? CP_UTURN_MAX_MS : 0;
