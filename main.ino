@@ -585,7 +585,9 @@ int navGetNextTurn()
     return DIR_FRONT;
   if (nav_mode == NAV_RETURN)
     return (int)nav_return_buf[nav_route_idx];
-  return (nav_route != nullptr) ? (int)nav_route[nav_route_idx] : DIR_FRONT;
+  if (nav_route != nullptr)
+    return nav_route[nav_route_idx];
+  return DIR_FRONT;
 }
 
 bool navHasMoreTurns()
@@ -1576,7 +1578,6 @@ void loop()
       last_event_time = now;
     }
     break;
-  }
 
   case ST_DONE:
   case ST_ERROR:
