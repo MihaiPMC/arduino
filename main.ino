@@ -157,10 +157,12 @@
 // ============ Recovery ============
 #define UTURN_MIN_MS 700
 #define UTURN_STOP_MS 180
+#define CP_UTURN_BACKOFF_SPEED 24
+#define CP_UTURN_BACKOFF_MS 420
 #define CP_UTURN_SPEED 34
 #define CP_UTURN_MIN_MS 420
 #define CP_UTURN_MAX_MS 1400
-#define CP_UTURN_STOP_MS 80
+#define CP_UTURN_STOP_MS 0
 #define LOST_GRACE_MS 450
 #define ENABLE_STUCK_WATCHDOG 0
 #define STUCK_MAX_MS 30000
@@ -179,7 +181,7 @@
 // 4=fata/sus, 5=dreapta-sus, 6=dreapta, 7=dreapta-jos.
 // ====================================================
 // <AI:turns_array>
-const int turns[] = {2, 4, 0, 2, 6, 2, 0, 2}; ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+const int turns[] = {6, 3, 3, 6, 0, 2, 5, 5, 6, 3, 3}; ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // </AI:turns_array>
 const int TURNS_LEN = sizeof(turns) / sizeof(turns[0]);
 
@@ -276,6 +278,7 @@ unsigned int maxAlignMsForDirection(int dir);
 char directionLogChar(int dir);
 void resetJunctionRefs();
 void prepareJunctionChoice(unsigned long now, bool from_checkpoint);
+void prepareCheckpointChoice(unsigned long now);
 bool joystickPressEdge();
 void waitJoystickRelease();
 long readVccMilliVolts();
@@ -492,6 +495,36 @@ void prepareJunctionChoice(unsigned long now, bool from_checkpoint)
   robotState = (planned_dir == DIR_BACK) ? ST_UTURN : ST_JCT_EXECUTE;
 #endif
   stateEnterTime = now;
+}
+
+void prepareCheckpointChoice(unsigned long now)
+{
+  int planned_dir = (moves_seq_idx < TURNS_LEN) ? turns[moves_seq_idx] : DIR_FRONT;
+  bool consumes_plan = moves_seq_idx < TURNS_LEN;
+  if (!validDirection(planned_dir))
+    planned_dir = DIR_FRONT;
+
+  // Pe checkpoint avem doar doua iesiri reale: inapoi sau inainte peste patrat.
+  if (planned_dir != DIR_BACK)
+    planned_dir = DIR_FRONT;
+
+  jct_target_dir = planned_dir;
+  jct_choice = directionLogChar(planned_dir);
+  jct_consumes_plan = consumes_plan;
+  jct_execute_ms = 0;
+  jct_turn_aligned = false;
+  jct_align_seen_since = 0;
+  jct_commit_start = 0;
+  uturn_from_checkpoint = planned_dir == DIR_BACK;
+
+  logMove(jct_choice);
+  if (jct_consumes_plan)
+    moves_seq_idx++;
+
+  cp_exit_time = 0;
+  last_event_time = now;
+  stateEnterTime = now;
+  robotState = (planned_dir == DIR_BACK) ? ST_UTURN : ST_CP_CONFIRMED;
 }
 
 // ============ Joystick / IR / battery (identic) ============
@@ -1115,7 +1148,7 @@ void loop()
 #endif
       last_event_time = now;
       resetJunctionRefs();
-      prepareJunctionChoice(now, true);
+      prepareCheckpointChoice(now);
     }
     else if (cp_lost_too_long || cp_confirm_timeout)
     {
@@ -1187,14 +1220,14 @@ void loop()
 
   case ST_UTURN:
   {
-    unsigned int stop_ms = uturn_from_checkpoint ? CP_UTURN_STOP_MS : UTURN_STOP_MS;
+    unsigned int pre_turn_ms = uturn_from_checkpoint ? CP_UTURN_BACKOFF_MS : UTURN_STOP_MS;
     unsigned int min_ms = uturn_from_checkpoint ? CP_UTURN_MIN_MS : UTURN_MIN_MS;
     unsigned int max_ms = uturn_from_checkpoint ? CP_UTURN_MAX_MS : 0;
     bool checkpoint_line = !cp_pad_seen && cp_black_count <= CP_EXIT_BLACK_MAX &&
                            (s1 || s2 || s3);
     bool line_ready = uturn_from_checkpoint ? checkpoint_line : centered_line;
     unsigned long turn_time = now - stateEnterTime;
-    if (turn_time > (stop_ms + min_ms) && line_ready)
+    if (turn_time > (pre_turn_ms + min_ms) && line_ready)
     {
       uturn_from_checkpoint = false;
       robotState = ST_NORMAL;
@@ -1202,10 +1235,11 @@ void loop()
       last_event_time = now;
     }
     else if (uturn_from_checkpoint && max_ms > 0 &&
-             turn_time > (stop_ms + max_ms) && !cp_pad_seen)
+             turn_time > (pre_turn_ms + max_ms))
     {
       uturn_from_checkpoint = false;
-      robotState = ST_NORMAL;
+      robotState = cp_pad_seen ? ST_CP_CONFIRMED : ST_NORMAL;
+      cp_exit_time = 0;
       stateEnterTime = now;
       last_event_time = now;
     }
@@ -1376,24 +1410,33 @@ void loop()
     break;
   case ST_UTURN:
   {
-    unsigned int stop_ms = uturn_from_checkpoint ? CP_UTURN_STOP_MS : UTURN_STOP_MS;
-    if ((now - stateEnterTime) < stop_ms)
+    unsigned long t = now - stateEnterTime;
+    if (uturn_from_checkpoint && t < CP_UTURN_BACKOFF_MS)
     {
-      left_speed = 0;
-      right_speed = 0;
+      left_speed = right_speed = -CP_UTURN_BACKOFF_SPEED;
     }
     else
     {
-      int p = uturn_from_checkpoint ? CP_UTURN_SPEED : SHARP_PIVOT_SPEED;
-      if (recent_side >= 0)
+      unsigned int stop_ms = uturn_from_checkpoint ? CP_UTURN_STOP_MS : UTURN_STOP_MS;
+      unsigned long pivot_time = uturn_from_checkpoint ? (t - CP_UTURN_BACKOFF_MS) : t;
+      if (pivot_time < stop_ms)
       {
-        left_speed = p;
-        right_speed = -p;
+        left_speed = 0;
+        right_speed = 0;
       }
       else
       {
-        left_speed = -p;
-        right_speed = p;
+        int p = uturn_from_checkpoint ? CP_UTURN_SPEED : SHARP_PIVOT_SPEED;
+        if (recent_side >= 0)
+        {
+          left_speed = p;
+          right_speed = -p;
+        }
+        else
+        {
+          left_speed = -p;
+          right_speed = p;
+        }
       }
     }
     led_color = 0xFF00FF;
