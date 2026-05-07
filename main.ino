@@ -248,6 +248,11 @@ unsigned long edge_right_since = 0;
 unsigned long fork_since = 0;
 unsigned long shallow_left_since = 0;
 unsigned long shallow_right_since = 0;
+// Mutate din static local in loop() pentru a putea fi resetate din resetArmTimers()
+unsigned long widen_since = 0;
+unsigned long err_jump_since = 0;
+int prev_error = 0;
+uint8_t err_jump_streak = 0; // frame-uri consecutive cu salt mare de eroare
 
 // ===== timing CP =====
 unsigned long cp_entry_since = 0;
@@ -283,6 +288,7 @@ unsigned int minAlignMsForDirection(int dir);
 unsigned int maxAlignMsForDirection(int dir);
 char directionLogChar(int dir);
 void resetJunctionRefs();
+void resetArmTimers();
 void prepareJunctionChoice(unsigned long now, bool from_checkpoint);
 void prepareCheckpointChoice(unsigned long now);
 bool joystickPressEdge();
@@ -462,6 +468,25 @@ void resetJunctionRefs()
   jct_align_seen_since = 0;
   jct_commit_start = 0;
   uturn_from_checkpoint = false;
+}
+
+// Reseteaza toti acumulatorii de timp pentru detectia de junction.
+// Se apeleaza la tranzitia in stari de junction/CP pentru a preveni
+// re-triggerarea imediata din timere vechi.
+void resetArmTimers()
+{
+  left_arm_since = 0;
+  right_arm_since = 0;
+  dense_since = 0;
+  edge_left_since = 0;
+  edge_right_since = 0;
+  fork_since = 0;
+  shallow_left_since = 0;
+  shallow_right_since = 0;
+  widen_since = 0;
+  err_jump_since = 0;
+  err_jump_streak = 0;
+  prev_error = 0;
 }
 
 void prepareJunctionChoice(unsigned long now, bool from_checkpoint)
@@ -822,6 +847,10 @@ void setup()
   fork_since = 0;
   shallow_left_since = 0;
   shallow_right_since = 0;
+  widen_since = 0;
+  err_jump_since = 0;
+  err_jump_streak = 0;
+  prev_error = 0;
   // 4) Beep + LED verde scurt ca semnal vizibil de "GO"
   for (int k = 0; k < 4; k++)
     RGB.setPixelColor(k, 0x00FF00);
@@ -890,26 +919,34 @@ void loop()
   }
 
   // ===== Detectie saritura brusca de eroare (semn de bifurcatie Y) =====
-  static int prev_error = 0;
-  static unsigned long err_jump_since = 0;
+  // prev_error, err_jump_since, err_jump_streak sunt globale (pot fi resetate din resetArmTimers).
+  // Necesitam 2 frame-uri consecutive cu salt >= JCT_ERR_JUMP pentru a evita spike-uri
+  // accidentale pe curbe stranse. Resetam imediat cand conditia inceteaza.
   int err_delta = abs(error - prev_error);
   bool err_jump_now = line_visible && !dense_black && (err_delta >= JCT_ERR_JUMP);
   if (err_jump_now)
   {
-    if (err_jump_since == 0)
+    err_jump_streak++;
+    if (err_jump_streak >= 2 && err_jump_since == 0)
       err_jump_since = now;
   }
-  else if (err_jump_since != 0 && (now - err_jump_since) > 100)
+  else
+  {
+    err_jump_streak = 0;
     err_jump_since = 0;
+  }
   prev_error = error;
 
   // ===== Trackere trigger junction =====
-  // side: exterior + linie apropiata (T-uri si cross-uri clasice).
-  // Pentru Y folosim s1+s3 impreuna, dar doar daca nu seamana cu patrat/checkpoint.
-  bool left_branch_shape = s0 && (s1 || s2);
-  bool right_branch_shape = s4 && (s3 || s2);
+  // Curbe pure (numai senzorii ipsilaterali activi, fara centru sau parte opusa):
   bool left_curve_edge = (s0 || s1) && !s2 && !s3 && !s4;
   bool right_curve_edge = (s4 || s3) && !s2 && !s1 && !s0;
+
+  // side: exterior + linie apropiata. Cerem si cel putin un senzor contralateral (s2/s3/s4
+  // pentru stanga, s2/s1/s0 pentru dreapta) pentru a exclude curbe stranse unde numai
+  // senzorii ipsilaterali (s0+s1 sau s4+s3) sunt activi fara centru.
+  bool left_branch_shape  = s0 && (s1 || s2) && (s2 || s3 || s4);
+  bool right_branch_shape = s4 && (s3 || s2) && (s2 || s1 || s0);
   bool y_fork_shape = !cp_pad_seen && !dense_black && s1 && s3 &&
                       (s2 || abs(error) < 700);
   bool shallow_left_shape = !dense_square_like && !cp_pad_seen && s0 && s1 &&
@@ -974,8 +1011,7 @@ void loop()
   }
   else
     shallow_right_since = 0;
-  // NOU: widen - linia "se lateste". Centru vizibil + oricare lateral activ
-  static unsigned long widen_since = 0;
+  // widen - linia "se lateste". Centru vizibil + oricare lateral activ (global, nu static local)
   bool curve_widen = s2 && ((s0 && !s3 && !s4) || (s4 && !s0 && !s1));
   bool widen_now = !dense_square_like && s2 && (s0 || s4) && !curve_widen;
   if (widen_now)
@@ -1111,6 +1147,14 @@ void loop()
       integral = 0;
       last_error = 0;
       resetJunctionRefs();
+      resetArmTimers();
+      // Daca trigger-ul includea senzorii exteriori (s0/s4), colturile au
+      // fost deja vazute inainte de ST_JCT_ENTRY; le marcam direct ca sa
+      // permitem exitul din blob imediat dupa JCT_ENTRY_MIN_MS.
+      if (arm_left_side || arm_edge_l || arm_shallow_l ||
+          arm_right_side || arm_edge_r || arm_shallow_r ||
+          arm_dense || arm_widen)
+        jct_saw_entry_corners = true;
 #if ENABLE_ODOMETRY
       odo_dist_at_last_jct = odo_dist_mm;
 #endif
@@ -1183,6 +1227,7 @@ void loop()
 #endif
       last_event_time = now;
       resetJunctionRefs();
+      resetArmTimers();
       prepareCheckpointChoice(now);
     }
     else if (cp_lost_too_long || cp_confirm_timeout)
@@ -1193,14 +1238,15 @@ void loop()
       cp_dense_since = 0;
       cp_last_seen = 0;
       resetJunctionRefs();
+      resetArmTimers();
 #if ENABLE_ODOMETRY
       odo_dist_at_last_jct = odo_dist_mm;
 #endif
-      if (cp_jct_pending || jct_armed || arm_left_side || arm_right_side || arm_dense ||
-          arm_edge_l || arm_edge_r || arm_widen || arm_err_jump || arm_fork ||
-          arm_shallow_l || arm_shallow_r)
+      if (cp_jct_pending || jct_armed)
       {
         cp_jct_pending = false;
+        // Colturile au fost vazute inainte de CP_CANDIDATE (robotul era pe un blob dens)
+        jct_saw_entry_corners = true;
         robotState = ST_JCT_ENTRY;
       }
       else
