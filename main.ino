@@ -100,6 +100,7 @@
 #define JCT_ARM_DENSE_MS 55     // 4-5 negri pentru cross/Y
 #define JCT_ARM_EDGE_MS 70      // s0/s4 cu error mare (Y, tangente)
 #define JCT_ARM_WIDEN_MS 45     // linia se "lateste": centru + lateral oricare
+#define JCT_ARM_FORK_MS 35      // Y: ambele ramuri interioare apar fara patrat plin
 #define JCT_CONFIRM_MS 15       // confirmare suplimentara impotriva glitch-urilor
 #define JCT_MIN_DIST_MM 100     // distanta minima parcursa intre 2 junctions
 #define JCT_ENTRY_MIN_MS 220
@@ -239,6 +240,7 @@ unsigned long right_arm_since = 0;
 unsigned long dense_since = 0;
 unsigned long edge_left_since = 0;
 unsigned long edge_right_since = 0;
+unsigned long fork_since = 0;
 
 // ===== timing CP =====
 unsigned long cp_entry_since = 0;
@@ -777,6 +779,7 @@ void setup()
   dense_since = 0;
   edge_left_since = 0;
   edge_right_since = 0;
+  fork_since = 0;
   // 4) Beep + LED verde scurt ca semnal vizibil de "GO"
   for (int k = 0; k < 4; k++)
     RGB.setPixelColor(k, 0x00FF00);
@@ -859,11 +862,13 @@ void loop()
 
   // ===== Trackere trigger junction =====
   // side: exterior + linie apropiata (T-uri si cross-uri clasice).
-  // Nu folosim s1/s3 singuri aici, altfel o linie lata devine fals "intersectie".
+  // Pentru Y folosim s1+s3 impreuna, dar doar daca nu seamana cu patrat/checkpoint.
   bool left_branch_shape = s0 && s2;
   bool right_branch_shape = s4 && s2;
   bool left_curve_edge = (s0 || s1) && !s2 && !s3 && !s4;
   bool right_curve_edge = (s4 || s3) && !s2 && !s1 && !s0;
+  bool y_fork_shape = !cp_pad_seen && !dense_black && s1 && s3 &&
+                      (s2 || abs(error) < 700);
   if (left_branch_shape)
   {
     if (left_arm_since == 0)
@@ -901,6 +906,13 @@ void loop()
   }
   else
     edge_right_since = 0;
+  if (y_fork_shape)
+  {
+    if (fork_since == 0)
+      fork_since = now;
+  }
+  else
+    fork_since = 0;
   // NOU: widen - linia "se lateste". Centru vizibil + oricare lateral activ
   static unsigned long widen_since = 0;
   bool curve_widen = s2 && ((s0 && !s3 && !s4) || (s4 && !s0 && !s1));
@@ -920,6 +932,7 @@ void loop()
   bool arm_edge_r = edge_right_since && (now - edge_right_since) >= (JCT_ARM_EDGE_MS + JCT_CONFIRM_MS);
   bool arm_err_jump = err_jump_since && (now - err_jump_since) >= JCT_ERR_JUMP_MS;
   bool arm_widen = widen_since && (now - widen_since) >= JCT_ARM_WIDEN_MS;
+  bool arm_fork = fork_since && (now - fork_since) >= (JCT_ARM_FORK_MS + JCT_CONFIRM_MS);
 
   // Gating intre 2 intersectii (anti-rebound)
 #if ENABLE_ODOMETRY
@@ -930,7 +943,8 @@ void loop()
 
   // Trigger ferm: ORICE modalitate persistenta declanseaza
   bool jct_armed = jct_gap_ok && (arm_left_side || arm_right_side || arm_dense ||
-                                  arm_edge_l || arm_edge_r || arm_widen || arm_err_jump);
+                                  arm_edge_l || arm_edge_r || arm_widen ||
+                                  arm_err_jump || arm_fork);
 
   // ===== Tracker CP cu grace period =====
   // Pornim pe un semn mai slab (3 senzori lati) ca sa nu ne fure junction-ul,
@@ -970,7 +984,7 @@ void loop()
     cp_dense_since = 0;
     cp_last_seen = 0;
   }
-  bool cp_prelim = cp_allowed && cp_entry_since && ((now - cp_entry_since) >= CP_APPROACH_MS);
+  bool cp_prelim = cp_allowed && cp_dense_since && ((now - cp_dense_since) >= CP_APPROACH_MS);
 
   // recent_side pentru recovery
   if (robotState == ST_NORMAL && line_visible && !dense_black)
@@ -1115,7 +1129,7 @@ void loop()
       odo_dist_at_last_jct = odo_dist_mm;
 #endif
       if (jct_armed || arm_left_side || arm_right_side || arm_dense ||
-          arm_edge_l || arm_edge_r || arm_widen || arm_err_jump)
+          arm_edge_l || arm_edge_r || arm_widen || arm_err_jump || arm_fork)
       {
         robotState = ST_JCT_ENTRY;
       }
