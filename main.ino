@@ -78,11 +78,15 @@
 
 // ============ CHECKPOINT (PATRAT NEGRU PLIN) - imbunatatit ============
 #define CP_BLACK_THRESHOLD 500  // prag mai relaxat decat BLACK_THRESHOLD (patrat are reflexe variabile)
+#define CP_APPROACH_BLACK_COUNT 3
+#define CP_APPROACH_MS 45       // primul semn ca intram pe patrat, inainte de 4/5 senzori
 #define CP_MIN_BLACK_COUNT 4    // 4 din 5 senzori negri = pe patrat (era 5 strict)
-#define CP_PRELIM_MS 60         // initial pentru a suspecta CP (redus)
 #define CP_FULL_MS 180          // durata totala pentru confirmare (redusa - era 220)
+#define CP_SETTLE_MS 120        // intra putin mai mult in patrat inainte de decizie
 #define CP_GLITCH_GRACE_MS 40   // toleranta scurta cand un senzor pierde negrul
 #define CP_EXIT_BLACK_MAX 2     // <=2 senzori negri => iesit din patrat
+#define CP_CONFIRM_MAX_MS 720   // daca nu devine checkpoint clar, revine la junction/linie
+#define CP_APPROACH_SPEED 22
 #define CP_LOCKOUT_MS 1500      // dupa CP, ignora alte detectii
 #define CP_MAX_DURATION_MS 6000 // patratul de checkpoint poate fi mare
 #define CP_REACQUIRE_MS 1200    // dupa patrat, mergi drept pana regasesti linia
@@ -237,9 +241,10 @@ unsigned long edge_left_since = 0;
 unsigned long edge_right_since = 0;
 
 // ===== timing CP =====
+unsigned long cp_entry_since = 0;
+unsigned long cp_entry_last_seen = 0;
 unsigned long cp_dense_since = 0;
 unsigned long cp_last_seen = 0;
-unsigned long cp_enter_time = 0;
 unsigned long cp_exit_time = 0;
 
 // ===== junction snapshots =====
@@ -762,6 +767,8 @@ void setup()
   integral = 0;
   last_error = 0;
   recent_side = 0;
+  cp_entry_since = 0;
+  cp_entry_last_seen = 0;
   cp_dense_since = 0;
   cp_last_seen = 0;
   cp_exit_time = 0;
@@ -807,6 +814,9 @@ void loop()
   bool s2 = sensorValues[2] > CENTER_BLACK;
   bool s3 = sensorValues[3] > JCT_INNER_THRESHOLD;
   bool s4 = sensorValues[4] > JCT_SIDE_THRESHOLD;
+  bool cp_entry_seen = cp_pad_seen ||
+                       (cp_black_count >= CP_APPROACH_BLACK_COUNT &&
+                        s2 && (s1 || s3) && (s0 || s4));
 
   // Live runs (debug OLED)
   static unsigned long left_black_start = 0, right_black_start = 0;
@@ -923,11 +933,24 @@ void loop()
                                   arm_edge_l || arm_edge_r || arm_widen || arm_err_jump);
 
   // ===== Tracker CP cu grace period =====
-  // Folosim cp_pad_seen (4/5 cu prag relaxat) si toleram mici intreruperi
+  // Pornim pe un semn mai slab (3 senzori lati) ca sa nu ne fure junction-ul,
+  // dar confirmam doar dupa 4/5 senzori negri stabil.
   bool cp_allowed = now >= checkpoint_lockout_until;
-  // (cp_last_seen e global)
-  if (cp_allowed && (robotState == ST_NORMAL || robotState == ST_LOST))
+  bool cp_tracking_state = (robotState == ST_NORMAL || robotState == ST_LOST ||
+                            robotState == ST_CP_CANDIDATE);
+  if (cp_allowed && cp_tracking_state)
   {
+    if (cp_entry_seen)
+    {
+      if (cp_entry_since == 0)
+        cp_entry_since = now;
+      cp_entry_last_seen = now;
+    }
+    else if (cp_entry_since != 0 && (now - cp_entry_last_seen) > CP_GLITCH_GRACE_MS)
+    {
+      cp_entry_since = 0;
+    }
+
     if (cp_pad_seen)
     {
       if (cp_dense_since == 0)
@@ -942,10 +965,12 @@ void loop()
   }
   else
   {
+    cp_entry_since = 0;
+    cp_entry_last_seen = 0;
     cp_dense_since = 0;
     cp_last_seen = 0;
   }
-  bool cp_prelim = cp_allowed && cp_dense_since && ((now - cp_dense_since) >= CP_PRELIM_MS);
+  bool cp_prelim = cp_allowed && cp_entry_since && ((now - cp_entry_since) >= CP_APPROACH_MS);
 
   // recent_side pentru recovery
   if (robotState == ST_NORMAL && line_visible && !dense_black)
@@ -996,7 +1021,6 @@ void loop()
     // declanseaza si "dense" deci ar putea fi confundat cu junction).
     else if (cp_prelim)
     {
-      cp_enter_time = cp_dense_since;
       last_event_time = now;
       robotState = ST_CP_CANDIDATE;
       stateEnterTime = now;
@@ -1033,7 +1057,6 @@ void loop()
     }
     else if (cp_prelim)
     {
-      cp_enter_time = cp_dense_since;
       last_event_time = now;
       robotState = ST_CP_CANDIDATE;
       stateEnterTime = now;
@@ -1055,30 +1078,22 @@ void loop()
 
   case ST_CP_CANDIDATE:
   {
-    // Avans incet drept; daca cp_pad_seen rezista CP_FULL_MS -> CP confirmat.
-    // Tolerez intreruperi scurte (CP_GLITCH_GRACE_MS).
-    // Daca scade sub prag mai mult de grace -> a fost cross/junction.
-    bool cp_lost_too_long = !cp_pad_seen && cp_last_seen != 0 &&
-                            (now - cp_last_seen) > CP_GLITCH_GRACE_MS;
-    if (cp_lost_too_long)
-    {
-      // A fost doar tranzitie (ex. cross). Trecem la junction logic.
-      cp_dense_since = 0;
-      resetJunctionRefs();
-#if ENABLE_ODOMETRY
-      odo_dist_at_last_jct = odo_dist_mm;
-#endif
-      robotState = ST_JCT_ENTRY;
-      stateEnterTime = now;
-      last_event_time = now;
-    }
-    else if ((now - cp_enter_time) >= (CP_PRELIM_MS + CP_FULL_MS))
+    // Avans incet drept. Confirmam doar daca 4/5 senzori raman negri suficient,
+    // apoi mai mergem foarte putin ca robotul sa fie in patrat, nu pe marginea lui.
+    bool cp_lost_too_long = cp_entry_last_seen != 0 &&
+                            (now - cp_entry_last_seen) > CP_GLITCH_GRACE_MS;
+    bool cp_confirmed = cp_dense_since != 0 &&
+                        (now - cp_dense_since) >= (CP_FULL_MS + CP_SETTLE_MS);
+    bool cp_confirm_timeout = (now - stateEnterTime) > CP_CONFIRM_MAX_MS;
+    if (cp_confirmed)
     {
       // CP confirmat. Checkpoint-ul este nod de decizie si consuma turns[].
       checkpoint_count++;
       checkpoint_lockout_until = now + CP_LOCKOUT_MS;
       cp_exit_time = 0;
       logMove('C');
+      cp_entry_since = 0;
+      cp_entry_last_seen = 0;
       cp_dense_since = 0;
       cp_last_seen = 0;
 #if ENABLE_ODOMETRY
@@ -1087,6 +1102,29 @@ void loop()
       last_event_time = now;
       resetJunctionRefs();
       prepareJunctionChoice(now, true);
+    }
+    else if (cp_lost_too_long || cp_confirm_timeout)
+    {
+      // A fost doar o tranzitie lata (ex. cross/junction), nu patrat de checkpoint.
+      cp_entry_since = 0;
+      cp_entry_last_seen = 0;
+      cp_dense_since = 0;
+      cp_last_seen = 0;
+      resetJunctionRefs();
+#if ENABLE_ODOMETRY
+      odo_dist_at_last_jct = odo_dist_mm;
+#endif
+      if (jct_armed || arm_left_side || arm_right_side || arm_dense ||
+          arm_edge_l || arm_edge_r || arm_widen || arm_err_jump)
+      {
+        robotState = ST_JCT_ENTRY;
+      }
+      else
+      {
+        robotState = line_visible ? ST_NORMAL : ST_LOST;
+      }
+      stateEnterTime = now;
+      last_event_time = now;
     }
     break;
   }
@@ -1257,9 +1295,9 @@ void loop()
   switch (robotState)
   {
   case ST_NORMAL:
-    if (dense_black)
+    if (cp_entry_seen || dense_black)
     {
-      left_speed = right_speed = INTERSECTION_SPEED;
+      left_speed = right_speed = cp_entry_seen ? CP_APPROACH_SPEED : INTERSECTION_SPEED;
     }
     else if (error < -PIVOT_THRESHOLD && (s0 || s1))
     {
@@ -1310,8 +1348,8 @@ void loop()
     break;
   }
   case ST_CP_CANDIDATE:
-    // continua drept incet; PID pe linie centrata = 0 (toti senzorii negri)
-    left_speed = right_speed = INTERSECTION_SPEED;
+    // continua drept incet ca sa ajunga stabil in patrat inainte de decizie
+    left_speed = right_speed = CP_APPROACH_SPEED;
     led_color = 0xFFFFFF;
     break;
   case ST_CP_CONFIRMED:
