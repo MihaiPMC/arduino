@@ -57,12 +57,12 @@
 #define OBSTACLE_DEBOUNCE_MS 120
 
 // ============ Motion / PID ============
-#define MAX_SPEED 36
-#define MIN_SPEED 34
+#define MAX_SPEED 32
+#define MIN_SPEED 30
 #define CURVE_SLOWDOWN 45
 #define PIVOT_THRESHOLD 1450
-#define SHARP_PIVOT_SPEED 75
-#define INTERSECTION_SPEED 22
+#define SHARP_PIVOT_SPEED 68
+#define INTERSECTION_SPEED 20
 #define ERROR_DEADBAND 70
 #define KP_DIV 13
 #define KD_MULT 1
@@ -79,14 +79,14 @@
 // ============ CHECKPOINT (PATRAT NEGRU PLIN) - imbunatatit ============
 #define CP_BLACK_THRESHOLD 500  // prag mai relaxat decat BLACK_THRESHOLD (patrat are reflexe variabile)
 #define CP_APPROACH_BLACK_COUNT 3
-#define CP_APPROACH_MS 45       // primul semn ca intram pe patrat, inainte de 4/5 senzori
+#define CP_APPROACH_MS 95       // asteapta mai mult ca T/cross sa poata fi prins ca intersectie
 #define CP_MIN_BLACK_COUNT 4    // 4 din 5 senzori negri = pe patrat (era 5 strict)
 #define CP_FULL_MS 180          // durata totala pentru confirmare (redusa - era 220)
 #define CP_SETTLE_MS 120        // intra putin mai mult in patrat inainte de decizie
 #define CP_GLITCH_GRACE_MS 40   // toleranta scurta cand un senzor pierde negrul
 #define CP_EXIT_BLACK_MAX 2     // <=2 senzori negri => iesit din patrat
 #define CP_CONFIRM_MAX_MS 720   // daca nu devine checkpoint clar, revine la junction/linie
-#define CP_APPROACH_SPEED 22
+#define CP_APPROACH_SPEED 20
 #define CP_LOCKOUT_MS 1500      // dupa CP, ignora alte detectii
 #define CP_MAX_DURATION_MS 6000 // patratul de checkpoint poate fi mare
 #define CP_REACQUIRE_MS 1200    // dupa patrat, mergi drept pana regasesti linia
@@ -97,7 +97,7 @@
 #define JCT_SIDE_THRESHOLD 420
 #define JCT_INNER_THRESHOLD 500 // pt s1/s3 (inner) la detectie laterala
 #define JCT_ARM_SIDE_MS 35      // ramura pe s0/s4 + linie apropiata stabila
-#define JCT_ARM_DENSE_MS 55     // 4-5 negri pentru cross/Y
+#define JCT_ARM_DENSE_MS 45     // 4-5 negri pentru cross/Y
 #define JCT_ARM_EDGE_MS 70      // s0/s4 cu error mare (Y, tangente)
 #define JCT_ARM_WIDEN_MS 45     // linia se "lateste": centru + lateral oricare
 #define JCT_ARM_FORK_MS 35      // Y: ambele ramuri interioare apar fara patrat plin
@@ -147,7 +147,7 @@
 
 // ============ Circle / tight curve following ============
 #define CIRCLE_INNER_SPEED 12
-#define CIRCLE_OUTER_SPEED 36
+#define CIRCLE_OUTER_SPEED 32
 
 // ============ Calibration ============
 #define CALIBRATION_PWM 42
@@ -157,7 +157,7 @@
 // ============ Recovery ============
 #define UTURN_MIN_MS 700
 #define UTURN_STOP_MS 180
-#define CP_UTURN_ADVANCE_SPEED 22
+#define CP_UTURN_ADVANCE_SPEED 20
 #define CP_UTURN_ADVANCE_MS 280
 #define CP_UTURN_SPEED 34
 #define CP_UTURN_MIN_MS 420
@@ -843,6 +843,7 @@ void loop()
   bool dense_black = (sensors_black == 5);
   // semnatura CP: >= 4 din 5 senzori vad negru cu prag relaxat
   bool cp_pad_seen = (cp_black_count >= CP_MIN_BLACK_COUNT);
+  bool dense_square_like = cp_pad_seen && dense_black;
 
   // Senzori cu praguri RELAXATE pentru detectie junction
   bool s0 = sensorValues[0] > JCT_SIDE_THRESHOLD;
@@ -896,8 +897,8 @@ void loop()
   // ===== Trackere trigger junction =====
   // side: exterior + linie apropiata (T-uri si cross-uri clasice).
   // Pentru Y folosim s1+s3 impreuna, dar doar daca nu seamana cu patrat/checkpoint.
-  bool left_branch_shape = s0 && s2;
-  bool right_branch_shape = s4 && s2;
+  bool left_branch_shape = !dense_square_like && s0 && (s1 || s2);
+  bool right_branch_shape = !dense_square_like && s4 && (s3 || s2);
   bool left_curve_edge = (s0 || s1) && !s2 && !s3 && !s4;
   bool right_curve_edge = (s4 || s3) && !s2 && !s1 && !s0;
   bool y_fork_shape = !cp_pad_seen && !dense_black && s1 && s3 &&
@@ -917,7 +918,7 @@ void loop()
   else
     right_arm_since = 0;
   // dense: 4-5 negri (cu prag normal)
-  if (sensors_black >= 4)
+  if (sensors_black >= 4 && !dense_square_like)
   {
     if (dense_since == 0)
       dense_since = now;
@@ -949,7 +950,7 @@ void loop()
   // NOU: widen - linia "se lateste". Centru vizibil + oricare lateral activ
   static unsigned long widen_since = 0;
   bool curve_widen = s2 && ((s0 && !s3 && !s4) || (s4 && !s0 && !s1));
-  bool widen_now = s2 && (s0 || s4) && !curve_widen;
+  bool widen_now = !dense_square_like && s2 && (s0 || s4) && !curve_widen;
   if (widen_now)
   {
     if (widen_since == 0)
