@@ -56,13 +56,13 @@
 #define OBSTACLE_STOP_MS 350
 #define OBSTACLE_DEBOUNCE_MS 120
 
-// ============ Motion / PID (NESCHIMBATE) ============
-#define MAX_SPEED 40
-#define MIN_SPEED 38
+// ============ Motion / PID ============
+#define MAX_SPEED 36
+#define MIN_SPEED 34
 #define CURVE_SLOWDOWN 45
 #define PIVOT_THRESHOLD 1450
 #define SHARP_PIVOT_SPEED 75
-#define INTERSECTION_SPEED 24
+#define INTERSECTION_SPEED 22
 #define ERROR_DEADBAND 70
 #define KP_DIV 13
 #define KD_MULT 1
@@ -96,7 +96,7 @@
 // Pe linii reale, s0/s4 nu ating mereu 600 cand intra ramura - cu 420 prindem mult mai repede.
 #define JCT_SIDE_THRESHOLD 420
 #define JCT_INNER_THRESHOLD 500 // pt s1/s3 (inner) la detectie laterala
-#define JCT_ARM_SIDE_MS 45      // ramura pe s0/s4 + linie apropiata stabila
+#define JCT_ARM_SIDE_MS 35      // ramura pe s0/s4 + linie apropiata stabila
 #define JCT_ARM_DENSE_MS 55     // 4-5 negri pentru cross/Y
 #define JCT_ARM_EDGE_MS 70      // s0/s4 cu error mare (Y, tangente)
 #define JCT_ARM_WIDEN_MS 45     // linia se "lateste": centru + lateral oricare
@@ -147,7 +147,7 @@
 
 // ============ Circle / tight curve following ============
 #define CIRCLE_INNER_SPEED 12
-#define CIRCLE_OUTER_SPEED 40
+#define CIRCLE_OUTER_SPEED 36
 
 // ============ Calibration ============
 #define CALIBRATION_PWM 42
@@ -157,8 +157,8 @@
 // ============ Recovery ============
 #define UTURN_MIN_MS 700
 #define UTURN_STOP_MS 180
-#define CP_UTURN_BACKOFF_SPEED 24
-#define CP_UTURN_BACKOFF_MS 420
+#define CP_UTURN_ADVANCE_SPEED 22
+#define CP_UTURN_ADVANCE_MS 280
 #define CP_UTURN_SPEED 34
 #define CP_UTURN_MIN_MS 420
 #define CP_UTURN_MAX_MS 1400
@@ -1220,7 +1220,7 @@ void loop()
 
   case ST_UTURN:
   {
-    unsigned int pre_turn_ms = uturn_from_checkpoint ? CP_UTURN_BACKOFF_MS : UTURN_STOP_MS;
+    unsigned int pre_turn_ms = uturn_from_checkpoint ? CP_UTURN_ADVANCE_MS : UTURN_STOP_MS;
     unsigned int min_ms = uturn_from_checkpoint ? CP_UTURN_MIN_MS : UTURN_MIN_MS;
     unsigned int max_ms = uturn_from_checkpoint ? CP_UTURN_MAX_MS : 0;
     bool checkpoint_line = !cp_pad_seen && cp_black_count <= CP_EXIT_BLACK_MAX &&
@@ -1411,14 +1411,14 @@ void loop()
   case ST_UTURN:
   {
     unsigned long t = now - stateEnterTime;
-    if (uturn_from_checkpoint && t < CP_UTURN_BACKOFF_MS)
+    if (uturn_from_checkpoint && t < CP_UTURN_ADVANCE_MS)
     {
-      left_speed = right_speed = -CP_UTURN_BACKOFF_SPEED;
+      left_speed = right_speed = CP_UTURN_ADVANCE_SPEED;
     }
     else
     {
       unsigned int stop_ms = uturn_from_checkpoint ? CP_UTURN_STOP_MS : UTURN_STOP_MS;
-      unsigned long pivot_time = uturn_from_checkpoint ? (t - CP_UTURN_BACKOFF_MS) : t;
+      unsigned long pivot_time = uturn_from_checkpoint ? (t - CP_UTURN_ADVANCE_MS) : t;
       if (pivot_time < stop_ms)
       {
         left_speed = 0;
